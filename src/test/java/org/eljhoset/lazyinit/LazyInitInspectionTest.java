@@ -1033,4 +1033,152 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
                 getList2Text.contains("argument.setFilterOne(\"one\")"));
         assertTrue("getList2 must assign list2", getList2Text.contains("list2 = doGet(argument)"));
     }
+
+    // -----------------------------------------------------------------------
+    // If-guard preservation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Assignment inside {@code if (instanceObject != null)} — simple fix must generate
+     * {@code if (list == null) { if (instanceObject != null) { list = ...; } }}.
+     * The init() method and the if-guard must both be removed after the fix.
+     */
+    public void testIfGuardPreservedInSimpleLazyInit() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object instanceObject;
+                    private String list;
+
+                    void init() {
+                        if (instanceObject != null) {
+                            <caret>list = "value";
+                        }
+                    }
+
+                    String getList() {
+                        return list;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when assignment is inside an if-guard", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed when it becomes empty", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
+        assertTrue("Guard condition must be preserved inside null-check",
+                result.contains("if (instanceObject != null)"));
+        assertTrue("Guard must appear inside the outer null-check",
+                result.indexOf("if (list == null)") < result.indexOf("if (instanceObject != null)"));
+        assertTrue("Assignment must be inside the guard", result.contains("list = \"value\""));
+        assertTrue("Return must be preserved", result.contains("return list;"));
+    }
+
+    /**
+     * Assignment with a build-chain inside an if-guard — the preamble must be moved inside
+     * the guard block in the getter.
+     */
+    public void testIfGuardPreservedWithBuildChain() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object instanceObject;
+                    private String list;
+
+                    void init() {
+                        if (instanceObject != null) {
+                            String arg = "hello";
+                            <caret>list = arg + "_suffix";
+                        }
+                    }
+
+                    String getList() {
+                        return list;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when build-chain is inside an if-guard", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
+        assertTrue("Guard condition must appear inside null-check",
+                result.contains("if (instanceObject != null)"));
+        assertTrue("Preamble declaration must be inside the guard",
+                result.indexOf("if (instanceObject != null)") < result.indexOf("String arg"));
+        assertTrue("Assignment must be present", result.contains("list = arg + \"_suffix\""));
+        assertTrue("Return must be preserved", result.contains("return list;"));
+    }
+
+    /**
+     * DCL fix with an if-guard — the synchronized block's innermost body must contain
+     * {@code if (guard) { field = rhs; }}.
+     */
+    public void testIfGuardPreservedInDclFix() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object instanceObject;
+                    private String list;
+
+                    void init() {
+                        if (instanceObject != null) {
+                            <caret>list = "value";
+                        }
+                    }
+
+                    String getList() {
+                        return list;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to thread-safe lazy initialization (double-checked locking)");
+        assertNotNull("DCL fix must be offered when assignment is inside an if-guard", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Field must be volatile", result.contains("volatile String list"));
+        assertTrue("synchronized block must be present", result.contains("synchronized (this)"));
+        assertTrue("Guard condition must appear inside DCL block",
+                result.contains("if (instanceObject != null)"));
+        // Guard must be nested inside the inner null-check, which is inside synchronized
+        int syncIdx = result.indexOf("synchronized");
+        int guardIdx = result.indexOf("if (instanceObject != null)");
+        assertTrue("Guard must appear after synchronized", syncIdx < guardIdx);
+        assertTrue("Assignment must be inside the guard", result.contains("list = \"value\""));
+    }
+
+    /**
+     * When the if-guard condition references a local variable in the host method, the fix
+     * must NOT be offered because the condition cannot safely be moved to the getter.
+     */
+    public void testIfGuardBlockedWhenConditionReferencesLocal() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String list;
+
+                    void init() {
+                        Object localObj = new Object();
+                        if (localObj != null) {
+                            <caret>list = "value";
+                        }
+                    }
+
+                    String getList() {
+                        return list;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f -> f.getText().contains("lazy initialization")
+                || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered when guard condition references a local variable", hasLazyFix);
+    }
 }

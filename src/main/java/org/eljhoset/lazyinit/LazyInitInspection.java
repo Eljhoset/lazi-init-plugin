@@ -28,6 +28,14 @@ import java.util.stream.Stream;
 public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
     private static final Logger LOG = Logger.getInstance(LazyInitInspection.class);
 
+    /** Identifies the host method and any enclosing if-guard for an assignment. */
+    record HostContext(@NotNull PsiMethod method, @Nullable PsiIfStatement guardIfStatement) {
+        @Nullable String guardConditionText() {
+            PsiExpression cond = guardIfStatement == null ? null : guardIfStatement.getCondition();
+            return cond == null ? null : cond.getText();
+        }
+    }
+
     @Override
     public @NotNull PsiElementVisitor buildVisitor(@NotNull ProblemsHolder holder, boolean isOnTheFly) {
         return new JavaElementVisitor() {
@@ -44,9 +52,15 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         if (field == null) { debugSkip(expression, "left-hand side does not resolve to a field"); return; }
         if (!isEligibleField(field, expression)) return;
 
-        PsiMethod hostMethod = getDirectHostMethod(expression);
-        if (hostMethod == null) { debugSkip(expression, "assignment is not a direct statement in a method body"); return; }
+        HostContext hostCtx = getHostContext(expression);
+        if (hostCtx == null) { debugSkip(expression, "assignment is not in an eligible position"); return; }
+        PsiMethod hostMethod = hostCtx.method();
         if (hostMethod.isConstructor()) { debugSkip(expression, "host method '" + hostMethod.getName() + "' is a constructor"); return; }
+        if (hostCtx.guardIfStatement() != null
+                && !isGuardConditionMovable(hostCtx.guardIfStatement(), hostMethod)) {
+            debugSkip(expression, "guard condition references local variables — cannot move to getter");
+            return;
+        }
 
         PsiMethod getter = findSimpleGetter(field);
         if (getter == null) { debugSkip(expression, "no simple getter found for field '" + field.getName() + "'"); return; }
@@ -149,7 +163,19 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                                                   PsiAssignmentExpression expression) {
         PsiStatement assignmentStmt = PsiTreeUtil.getParentOfType(expression, PsiStatement.class);
         if (assignmentStmt == null) return false;
-        return isMovableBuildChain(collectBuildChainLocals(locals, hostMethod), hostMethod, assignmentStmt);
+        PsiCodeBlock effectiveBody = PsiTreeUtil.getParentOfType(assignmentStmt, PsiCodeBlock.class, true);
+        if (effectiveBody == null) return false;
+        List<PsiLocalVariable> chainLocals = collectBuildChainLocals(locals, effectiveBody, hostMethod);
+        // All chain locals must be declared inside the effective body.
+        // If a local is declared in the outer method body (and assignment is if-wrapped), the
+        // declaration cannot be copied into the getter preamble, so we block the fix.
+        for (PsiLocalVariable lv : chainLocals) {
+            if (!PsiTreeUtil.isAncestor(effectiveBody, lv, false)) {
+                debug("Chain local '" + lv.getName() + "' not declared inside effective body — blocking fix");
+                return false;
+            }
+        }
+        return isMovableBuildChain(chainLocals, hostMethod, assignmentStmt);
     }
 
     private static LocalQuickFix[] buildFixes(PsiField field, @Nullable PsiField varyingField) {
@@ -173,16 +199,67 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
     }
 
     /**
-     * Returns the enclosing method only when the assignment is a direct statement
-     * in that method's body — not nested inside a lambda, anonymous class, etc.
+     * Returns the host method and any enclosing if-guard for an assignment, or {@code null}
+     * when the assignment is not in an eligible position.
+     *
+     * <p>Eligible structures:
+     * <ul>
+     *   <li>Direct: {@code assignment → PsiExpressionStatement → PsiCodeBlock → PsiMethod}</li>
+     *   <li>If-wrapped: assignment is inside a braced if-block (no else) that is a direct
+     *       statement in a method body.</li>
+     * </ul>
      */
-    static @Nullable PsiMethod getDirectHostMethod(PsiAssignmentExpression assignment) {
-        PsiElement stmt = assignment.getParent();
-        if (!(stmt instanceof PsiExpressionStatement)) return null;
-        PsiElement block = stmt.getParent();
+    static @Nullable HostContext getHostContext(PsiAssignmentExpression assignment) {
+        PsiElement exprStmt = assignment.getParent();
+        if (!(exprStmt instanceof PsiExpressionStatement)) return null;
+        PsiElement block = exprStmt.getParent();
         if (!(block instanceof PsiCodeBlock)) return null;
-        PsiElement methodCandidate = block.getParent();
-        return methodCandidate instanceof PsiMethod m ? m : null;
+        PsiElement blockParent = block.getParent();
+
+        // Direct case: code block is the method body
+        if (blockParent instanceof PsiMethod method) {
+            return new HostContext(method, null);
+        }
+
+        // If-wrapped case: PsiCodeBlock → PsiBlockStatement → PsiIfStatement → PsiCodeBlock → PsiMethod
+        PsiIfStatement ifStmt = resolveEnclosingIfStatement(blockParent);
+        if (ifStmt == null || ifStmt.getElseBranch() != null) return null;
+        PsiElement outerBlock = ifStmt.getParent();
+        if (!(outerBlock instanceof PsiCodeBlock)) return null;
+        if (!(outerBlock.getParent() instanceof PsiMethod method)) return null;
+        return new HostContext(method, ifStmt);
+    }
+
+    /**
+     * Returns the {@link PsiIfStatement} whose then-branch directly contains {@code blockOrStatement},
+     * handling both {@code PsiCodeBlock → PsiBlockStatement → PsiIfStatement} and the rarer
+     * {@code PsiCodeBlock → PsiIfStatement} layouts that differ across PSI versions.
+     */
+    static @Nullable PsiIfStatement resolveEnclosingIfStatement(PsiElement blockOrStatement) {
+        if (blockOrStatement instanceof PsiBlockStatement bs
+                && bs.getParent() instanceof PsiIfStatement i) {
+            return i;
+        }
+        if (blockOrStatement instanceof PsiIfStatement i) {
+            return i;
+        }
+        return null;
+    }
+
+    /**
+     * Returns {@code true} when the condition of {@code guardIfStatement} is safe to move to
+     * a getter — i.e. it contains no references to local variables in {@code hostMethod}.
+     */
+    private static boolean isGuardConditionMovable(PsiIfStatement guardIfStatement, PsiMethod hostMethod) {
+        PsiExpression condition = guardIfStatement.getCondition();
+        if (condition == null) return false;
+        for (PsiReferenceExpression ref : allReferenceExpressions(condition)) {
+            if (ref.resolve() instanceof PsiLocalVariable lv
+                    && PsiTreeUtil.isAncestor(hostMethod, lv, true)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -280,13 +357,15 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         List<PsiLocalVariable> rhsLocals = findLocalVarsInExpr(rhs, hostMethod);
         if (rhsLocals.isEmpty()) return;
 
-        List<PsiLocalVariable> chainLocals = collectBuildChainLocals(rhsLocals, hostMethod);
+        PsiStatement assignStmt = PsiTreeUtil.getParentOfType(rhs, PsiStatement.class);
+        if (assignStmt == null) return;
+        PsiCodeBlock body = PsiTreeUtil.getParentOfType(assignStmt, PsiCodeBlock.class, true);
+        if (body == null) return;
+
+        List<PsiLocalVariable> chainLocals = collectBuildChainLocals(rhsLocals, body, hostMethod);
         if (chainLocals.isEmpty()) return;
 
         Set<PsiLocalVariable> chainSet = new HashSet<>(chainLocals);
-        PsiCodeBlock body = hostMethod.getBody();
-        PsiStatement assignStmt = PsiTreeUtil.getParentOfType(rhs, PsiStatement.class);
-        if (body == null || assignStmt == null) return;
 
         // Scan the declaration (constructor args may reference instance fields).
         for (PsiStatement stmt : body.getStatements()) {
@@ -305,10 +384,6 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                 if (!found.contains(f)) found.add(f);
             }
         }
-    }
-
-    private static boolean isChainPreambleStatement(PsiStatement stmt, Set<PsiLocalVariable> chainSet) {
-        return isDeclarationOfAny(stmt, chainSet) || isSetterCallOnAny(stmt, chainSet);
     }
 
     /**
@@ -386,20 +461,16 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         return deps;
     }
 
-    /**
-     * Returns {@code true} when {@code stmt} is a method-call statement with {@code local}
-     * as the direct qualifier (a setter/builder call) and every argument references no local
-     * variable declared in {@code scope}.
-     */
-    private static List<PsiLocalVariable> collectBuildChainLocals(List<PsiLocalVariable> roots, PsiMethod hostMethod) {
-        PsiCodeBlock body = hostMethod.getBody();
+    /** Searches {@code body} (not necessarily the method body) for setter dependencies. */
+    private static List<PsiLocalVariable> collectBuildChainLocals(List<PsiLocalVariable> roots,
+                                                                   @Nullable PsiCodeBlock body,
+                                                                   PsiMethod hostMethod) {
         if (body == null) return List.of();
 
         LinkedHashSet<PsiLocalVariable> closure = new LinkedHashSet<>();
         ArrayDeque<PsiLocalVariable> queue = new ArrayDeque<>(roots);
         while (!queue.isEmpty()) {
-            PsiLocalVariable local = queue.removeFirst();
-            expandBuildChainLocal(local, body, hostMethod, closure, queue);
+            expandBuildChainLocal(queue.removeFirst(), body, hostMethod, closure, queue);
         }
         return List.copyOf(closure);
     }
@@ -429,7 +500,7 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
 
     private static boolean isMovableBuildChain(List<PsiLocalVariable> locals, PsiMethod scope,
                                                PsiStatement assignmentStmt) {
-        PsiCodeBlock body = scope.getBody();
+        PsiCodeBlock body = PsiTreeUtil.getParentOfType(assignmentStmt, PsiCodeBlock.class, true);
         if (body == null) return false;
 
         Set<PsiLocalVariable> localSet = new HashSet<>(locals);
@@ -632,6 +703,25 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         return Character.toUpperCase(s.charAt(0)) + s.substring(1);
     }
 
+    /**
+     * Appends {@code bodyLines} to {@code sb} at {@code bodyIndent}, optionally wrapped in
+     * {@code if (guardCondition) { ... }} at {@code guardIndent}.
+     * When {@code guardCondition} is {@code null} the lines are written directly at {@code bodyIndent}.
+     */
+    static void appendGuardedLines(StringBuilder sb, @Nullable String guardCondition,
+                                   String guardIndent, String bodyIndent,
+                                   List<String> bodyLines) {
+        if (guardCondition != null) {
+            sb.append(guardIndent).append("if (").append(guardCondition).append(") {\n");
+        }
+        for (String line : bodyLines) {
+            sb.append(bodyIndent).append(line).append("\n");
+        }
+        if (guardCondition != null) {
+            sb.append(guardIndent).append("}\n");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Shared resolution context — eliminates duplicate resolve blocks across
     // the two quick-fix classes.
@@ -671,7 +761,8 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             @Nullable PsiExpressionStatement callSiteToRemove,
             List<String> preambleStatements,
             List<PsiStatement> preambleToRemove,
-            @Nullable PsiField varyingField
+            @Nullable PsiField varyingField,
+            @Nullable String guardConditionText
     ) {
         /** Derived — never stored separately. */
         String fieldName() { return field.getName(); }
@@ -687,11 +778,12 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                         + describeElement(assignment));
                 return null;
             }
-            PsiMethod hostMethod = getDirectHostMethod(assignment);
-            if (hostMethod == null) {
+            HostContext hostCtx = getHostContext(assignment);
+            if (hostCtx == null) {
                 debug("Cannot build fix context: host method is no longer available at " + describeElement(assignment));
                 return null;
             }
+            PsiMethod hostMethod = hostCtx.method();
             PsiMethod getter = findSimpleGetter(field);
             if (getter == null) {
                 debug("Cannot build fix context: getter for field '" + field.getName() + "' is no longer simple");
@@ -730,7 +822,8 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             return new FixContext(
                     assignment, field, hostMethod, getter,
                     effectiveRhsText, callSiteToRemove,
-                    preamble.texts(), preamble.nodes(), varyingField);
+                    preamble.texts(), preamble.nodes(), varyingField,
+                    hostCtx.guardConditionText());
         }
 
         // -- helpers kept private to FixContext --------------------------------
@@ -759,9 +852,9 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         private static Preamble collectPreamble(PsiExpression rhs, PsiMethod hostMethod,
                                                  @Nullable PsiStatement assignmentStmt) {
             if (assignmentStmt == null) return Preamble.EMPTY;
-            PsiCodeBlock body = hostMethod.getBody();
+            PsiCodeBlock body = PsiTreeUtil.getParentOfType(assignmentStmt, PsiCodeBlock.class, true);
             if (body == null) return Preamble.EMPTY;
-            List<PsiLocalVariable> locals = collectBuildChainLocals(findLocalVarsInExpr(rhs, hostMethod), hostMethod);
+            List<PsiLocalVariable> locals = collectBuildChainLocals(findLocalVarsInExpr(rhs, hostMethod), body, hostMethod);
             if (locals.isEmpty()) return Preamble.EMPTY;
 
             Set<PsiLocalVariable> localSet = new HashSet<>(locals);
@@ -805,14 +898,6 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             return new Preamble(texts, nodes);
         }
 
-        private static boolean isPartOfBuildChain(PsiStatement stmt, List<PsiLocalVariable> locals) {
-            if (stmt instanceof PsiDeclarationStatement decl && Arrays.stream(decl.getDeclaredElements())
-                        .anyMatch(elem -> elem instanceof PsiLocalVariable lv && locals.contains(lv))) {
-                    return true;
-                }
-
-            return locals.stream().anyMatch(lv -> containsReferenceToLocal(stmt, lv));
-        }
     }
 
     static void debug(String message) {

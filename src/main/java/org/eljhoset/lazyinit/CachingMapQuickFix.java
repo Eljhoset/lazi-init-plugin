@@ -7,6 +7,7 @@ import com.intellij.openapi.project.Project;
 import com.intellij.psi.*;
 import com.intellij.psi.codeStyle.JavaCodeStyleManager;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public class CachingMapQuickFix implements LocalQuickFix {
     private static final Logger LOG = Logger.getInstance(CachingMapQuickFix.class);
@@ -65,7 +66,7 @@ public class CachingMapQuickFix implements LocalQuickFix {
         // 2. Build and replace the getter body — the return statement changes, so a full
         //    body replacement is simpler and safer than inserting before the old return.
         String newBodyText = buildGetterBodyText(cacheName, varyingFieldName,
-                ctx.preambleStatements(), ctx.effectiveRhsText());
+                ctx.preambleStatements(), ctx.effectiveRhsText(), ctx.guardConditionText());
         PsiCodeBlock newBody = ctx.factory().createCodeBlockFromText(newBodyText, null);
 
         PsiCodeBlock getterBody = ctx.getter().getBody();
@@ -84,14 +85,13 @@ public class CachingMapQuickFix implements LocalQuickFix {
     }
 
     static String buildGetterBodyText(String cacheName, String varyingFieldName,
-                                      java.util.List<String> preamble, String rhsText) {
+                                      java.util.List<String> preamble, String rhsText,
+                                      @Nullable String guardCondition) {
         StringBuilder sb = new StringBuilder("{\n");
         sb.append("    if (!").append(cacheName).append(".containsKey(").append(varyingFieldName).append(")) {\n");
-        for (String stmt : preamble) {
-            sb.append("        ").append(stmt).append("\n");
-        }
-        sb.append("        ").append(cacheName).append(".put(")
-                .append(varyingFieldName).append(", ").append(rhsText).append(");\n");
+        java.util.List<String> body = new java.util.ArrayList<>(preamble);
+        body.add(cacheName + ".put(" + varyingFieldName + ", " + rhsText + ");");
+        LazyInitInspection.appendGuardedLines(sb, guardCondition, "        ", guardCondition != null ? "            " : "        ", body);
         sb.append("    }\n");
         sb.append("    return ").append(cacheName).append(".get(").append(varyingFieldName).append(");\n");
         sb.append("}");
@@ -101,7 +101,7 @@ public class CachingMapQuickFix implements LocalQuickFix {
     private static String boxedTypeName(PsiType type, PsiElement context) {
         if (type instanceof PsiPrimitiveType pt) {
             // PsiPrimitiveType.getBoxedType may return null in some SDK configurations;
-            // fall back to a hardcoded mapping so Map<K,V> type parameters are always valid.
+            // fall back to a hardcoded mapping so Map<K, V> type parameters are always valid.
             PsiClassType boxed = pt.getBoxedType(context);
             if (boxed != null) return boxed.getCanonicalText();
             return switch (pt.getCanonicalText()) {

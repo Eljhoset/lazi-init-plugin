@@ -6,7 +6,9 @@ import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.project.Project;
 import com.intellij.psi.*;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -30,7 +32,8 @@ public class LazyInitQuickFix implements LocalQuickFix {
                 + LazyInitInspection.describeElement(ctx.assignment()));
 
         PsiStatement ifStmt = ctx.factory().createStatementFromText(
-                buildNullCheckText(ctx.fieldName(), ctx.preambleStatements(), ctx.effectiveRhsText()),
+                buildNullCheckText(ctx.fieldName(), ctx.preambleStatements(), ctx.effectiveRhsText(),
+                        ctx.guardConditionText()),
                 null);
 
         PsiCodeBlock getterBody = ctx.getter().getBody();
@@ -47,12 +50,13 @@ public class LazyInitQuickFix implements LocalQuickFix {
         deleteCallSiteIfPresent(ctx);
     }
 
-    static String buildNullCheckText(String fieldName, List<String> preamble, String rhsText) {
+    static String buildNullCheckText(String fieldName, List<String> preamble, String rhsText,
+                                     @Nullable String guardCondition) {
         StringBuilder sb = new StringBuilder("if (").append(fieldName).append(" == null) {\n");
-        for (String stmt : preamble) {
-            sb.append("    ").append(stmt).append("\n");
-        }
-        sb.append("    ").append(fieldName).append(" = ").append(rhsText).append(";\n}");
+        List<String> body = new ArrayList<>(preamble);
+        body.add(fieldName + " = " + rhsText + ";");
+        LazyInitInspection.appendGuardedLines(sb, guardCondition, "    ", guardCondition != null ? "        " : "    ", body);
+        sb.append("}");
         return sb.toString();
     }
 
@@ -71,8 +75,21 @@ public class LazyInitQuickFix implements LocalQuickFix {
 
     static void removeAssignmentAndCleanup(PsiAssignmentExpression assignment, PsiMethod hostMethod) {
         PsiElement assignStmt = assignment.getParent(); // PsiExpressionStatement
+        // Capture the containing block before deleting the statement.
+        PsiElement containingBlock = assignStmt.getParent();
         assignStmt.delete();
         debug("Removed original assignment from host method '" + hostMethod.getName() + "'");
+
+        // Guard if-statements containing only the assignment become orphaned after removal; clean them up.
+        if (containingBlock instanceof PsiCodeBlock cb && cb.getStatements().length == 0) {
+            PsiIfStatement guardIf = LazyInitInspection.resolveEnclosingIfStatement(cb.getParent());
+            if (guardIf != null) {
+                PsiElement prev = guardIf.getPrevSibling();
+                if (prev instanceof PsiWhiteSpace) prev.delete();
+                guardIf.delete();
+                debug("Deleted now-empty if-guard from host method '" + hostMethod.getName() + "'");
+            }
+        }
 
         PsiCodeBlock hostBody = hostMethod.getBody();
         if (hostBody != null && hostBody.getStatements().length == 0) {
