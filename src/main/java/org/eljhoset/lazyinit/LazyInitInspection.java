@@ -285,10 +285,13 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         Set<PsiLocalVariable> chainSet = new HashSet<>(chainLocals);
         PsiCodeBlock body = hostMethod.getBody();
         PsiStatement assignStmt = PsiTreeUtil.getParentOfType(rhs, PsiStatement.class);
-        if (body == null) return;
+        if (body == null || assignStmt == null) return;
 
-        for (PsiStatement stmt : body.getStatements()) {
-            if (stmt != assignStmt && isChainPreambleStatement(stmt, chainSet)) {
+        // Scan only within the current segment to avoid picking up varying fields
+        // from setter calls that belong to other assignments sharing the same local.
+        PsiStatement segmentStart = findSegmentStart(body, assignStmt, chainSet);
+        for (PsiStatement stmt : statementsInSegment(body, segmentStart, assignStmt)) {
+            if (isChainPreambleStatement(stmt, chainSet)) {
                 for (PsiField f : collectInstanceFields(stmt, cls, assignedField)) {
                     if (!found.contains(f)) found.add(f);
                 }
@@ -424,10 +427,11 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         Set<PsiLocalVariable> localSet = new HashSet<>(locals);
         if (locals.stream().anyMatch(local -> hasLocalDependentInitializer(local, scope))) return false;
 
-        for (PsiStatement stmt : body.getStatements()) {
-            boolean shouldValidate = stmt != assignmentStmt
-                    && !isDeclarationOfAny(stmt, localSet)
-                    && referencesAnyLocal(stmt, locals);
+        // Only validate statements within the segment [segmentStart, assignmentStmt).
+        // Statements belonging to earlier or later segments are not part of this build chain.
+        PsiStatement segmentStart = findSegmentStart(body, assignmentStmt, localSet);
+        for (PsiStatement stmt : statementsInSegment(body, segmentStart, assignmentStmt)) {
+            boolean shouldValidate = !isDeclarationOfAny(stmt, localSet) && referencesAnyLocal(stmt, locals);
             if (shouldValidate && !isSetterCallOnAny(stmt, localSet)) {
                 debug("Build chain is not movable because of statement " + describeElement(stmt));
                 return false;
@@ -457,6 +461,64 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         if (!(stmt instanceof PsiDeclarationStatement decl)) return false;
         return Arrays.stream(decl.getDeclaredElements())
                 .anyMatch(elem -> elem instanceof PsiLocalVariable local && locals.contains(local));
+    }
+
+    /**
+     * Returns all statements in {@code body} that appear before {@code upToExclusive}
+     * (pass {@code null} to scan the entire body), are assignments to a {@link PsiField},
+     * and whose RHS references at least one local in {@code chainLocals}.
+     * These act as segment boundaries in the multi-assignment shared-local pattern.
+     */
+    static List<PsiStatement> findPeerFieldAssignmentsBefore(
+            PsiCodeBlock body, Set<PsiLocalVariable> chainLocals,
+            @Nullable PsiStatement upToExclusive) {
+        List<PsiStatement> result = new ArrayList<>();
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt == upToExclusive) break;
+            if (stmt instanceof PsiExpressionStatement exprStmt
+                    && exprStmt.getExpression() instanceof PsiAssignmentExpression assign
+                    && resolveToField(assign.getLExpression()) != null
+                    && chainLocals.stream().anyMatch(lv -> containsReferenceToLocal(stmt, lv))) {
+                result.add(stmt);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Returns the first statement of the segment containing {@code currentAssignmentStmt},
+     * or {@code null} if the segment starts at the beginning of the body.
+     * The segment starts immediately after the last peer field assignment before this one.
+     */
+    static @Nullable PsiStatement findSegmentStart(
+            PsiCodeBlock body, PsiStatement currentAssignmentStmt,
+            Set<PsiLocalVariable> chainLocals) {
+        List<PsiStatement> peers = findPeerFieldAssignmentsBefore(body, chainLocals, currentAssignmentStmt);
+        if (peers.isEmpty()) return null;
+        PsiStatement lastPeer = peers.getLast();
+        PsiStatement[] stmts = body.getStatements();
+        for (int i = 0; i < stmts.length - 1; i++) {
+            if (stmts[i] == lastPeer) return stmts[i + 1];
+        }
+        return null;
+    }
+
+    /**
+     * Returns the ordered list of statements in {@code body} that fall within the segment
+     * {@code [segmentStart, upToExclusive)}.  Pass {@code null} for {@code segmentStart}
+     * to start from the beginning of the body.
+     */
+    private static List<PsiStatement> statementsInSegment(PsiCodeBlock body,
+                                                           @Nullable PsiStatement segmentStart,
+                                                           PsiStatement upToExclusive) {
+        List<PsiStatement> result = new ArrayList<>();
+        boolean active = (segmentStart == null);
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt == upToExclusive) break;
+            if (stmt == segmentStart) active = true;
+            if (active) result.add(stmt);
+        }
+        return result;
     }
 
     /**
@@ -668,14 +730,35 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             List<PsiLocalVariable> locals = collectBuildChainLocals(findLocalVarsInExpr(rhs, hostMethod), hostMethod);
             if (locals.isEmpty()) return Preamble.EMPTY;
 
+            Set<PsiLocalVariable> localSet = new HashSet<>(locals);
+            PsiStatement segmentStart = findSegmentStart(body, assignmentStmt, localSet);
+
+            // In the multi-assignment pattern, the local's declaration is shared across segments.
+            // It must be copied into each getter's null-check text but kept in init until all
+            // assignments are converted (at which point cleanupUnusedLocalDeclarations removes it).
+            // In the single-assignment case, the declaration belongs to preambleToRemove as before.
+            boolean isMultiAssignment = findPeerFieldAssignmentsBefore(body, localSet, null)
+                    .stream().anyMatch(s -> s != assignmentStmt);
+
             List<String> texts = new ArrayList<>();
             List<PsiStatement> nodes = new ArrayList<>();
+
+            // Step A: declaration — always copied into getter; deleted from init only for single-assignment.
             for (PsiStatement stmt : body.getStatements()) {
-                if (stmt != assignmentStmt && isPartOfBuildChain(stmt, locals)) {
+                if (isDeclarationOfAny(stmt, localSet)) {
+                    texts.add(stmt.getText());
+                    if (!isMultiAssignment) nodes.add(stmt);
+                }
+            }
+
+            // Step B: segment-specific setters — always removed from init.
+            for (PsiStatement stmt : statementsInSegment(body, segmentStart, assignmentStmt)) {
+                if (!isDeclarationOfAny(stmt, localSet) && isPartOfBuildChain(stmt, locals)) {
                     texts.add(stmt.getText());
                     nodes.add(stmt);
                 }
             }
+
             return new Preamble(texts, nodes);
         }
 

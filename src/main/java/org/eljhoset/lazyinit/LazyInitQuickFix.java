@@ -7,6 +7,7 @@ import com.intellij.openapi.project.Project;
 import com.intellij.psi.*;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.Arrays;
 import java.util.List;
 
 public class LazyInitQuickFix implements LocalQuickFix {
@@ -42,6 +43,7 @@ public class LazyInitQuickFix implements LocalQuickFix {
 
         deletePreamble(ctx.preambleToRemove());
         removeAssignmentAndCleanup(ctx.assignment(), ctx.hostMethod());
+        if (ctx.hostMethod().isValid()) cleanupUnusedLocalDeclarations(ctx.hostMethod());
         deleteCallSiteIfPresent(ctx);
     }
 
@@ -83,6 +85,45 @@ public class LazyInitQuickFix implements LocalQuickFix {
             hostMethod.delete();
             debug("Deleted now-empty host method '" + hostMethod.getName() + "'");
         }
+    }
+
+    /**
+     * Removes declaration statements in {@code hostMethod} for locals that are no longer
+     * referenced anywhere in the body, then deletes the method itself if it becomes empty.
+     * Called after applying a fix in the multi-assignment shared-local pattern, where the
+     * declaration is kept in init until all assignments have been converted.
+     */
+    static void cleanupUnusedLocalDeclarations(PsiMethod hostMethod) {
+        PsiCodeBlock hostBody = hostMethod.getBody();
+        if (hostBody == null) return;
+
+        // Iterate until stable — one deletion may expose another unused declaration.
+        boolean deletedAny = true;
+        while (deletedAny) {
+            deletedAny = false;
+            for (PsiStatement stmt : hostBody.getStatements()) {
+                if (stmt instanceof PsiDeclarationStatement decl
+                        && Arrays.stream(decl.getDeclaredElements())
+                                .filter(PsiLocalVariable.class::isInstance)
+                                .map(PsiLocalVariable.class::cast)
+                                .allMatch(lv -> isUnreferencedInBody(lv, hostBody))) {
+                    stmt.delete();
+                    deletedAny = true;
+                    break; // hostBody.getStatements() is now stale; restart
+                }
+            }
+        }
+
+        if (hostBody.getStatements().length == 0) {
+            PsiElement prev = hostMethod.getPrevSibling();
+            if (prev instanceof PsiWhiteSpace) prev.delete();
+            hostMethod.delete();
+        }
+    }
+
+    private static boolean isUnreferencedInBody(PsiLocalVariable lv, PsiCodeBlock body) {
+        return Arrays.stream(body.getStatements())
+                .noneMatch(stmt -> LazyInitInspection.containsReferenceToLocal(stmt, lv));
     }
 
     private static void debug(String message) {

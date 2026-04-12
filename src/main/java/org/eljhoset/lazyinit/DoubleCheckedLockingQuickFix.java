@@ -59,6 +59,7 @@ public class DoubleCheckedLockingQuickFix implements LocalQuickFix {
 
         LazyInitQuickFix.deletePreamble(ctx.preambleToRemove());
         LazyInitQuickFix.removeAssignmentAndCleanup(ctx.assignment(), ctx.hostMethod());
+        if (ctx.hostMethod().isValid()) LazyInitQuickFix.cleanupUnusedLocalDeclarations(ctx.hostMethod());
         LazyInitQuickFix.deleteCallSiteIfPresent(ctx);
     }
 

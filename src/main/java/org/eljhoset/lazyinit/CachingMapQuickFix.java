@@ -79,6 +79,7 @@ public class CachingMapQuickFix implements LocalQuickFix {
         // 3. Clean up preamble, original assignment, and (possibly empty) host method
         LazyInitQuickFix.deletePreamble(ctx.preambleToRemove());
         LazyInitQuickFix.removeAssignmentAndCleanup(ctx.assignment(), ctx.hostMethod());
+        if (ctx.hostMethod().isValid()) LazyInitQuickFix.cleanupUnusedLocalDeclarations(ctx.hostMethod());
         LazyInitQuickFix.deleteCallSiteIfPresent(ctx);
     }
 
