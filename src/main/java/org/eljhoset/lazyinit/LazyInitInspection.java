@@ -703,25 +703,6 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         return Character.toUpperCase(s.charAt(0)) + s.substring(1);
     }
 
-    /**
-     * Appends {@code bodyLines} to {@code sb} at {@code bodyIndent}, optionally wrapped in
-     * {@code if (guardCondition) { ... }} at {@code guardIndent}.
-     * When {@code guardCondition} is {@code null} the lines are written directly at {@code bodyIndent}.
-     */
-    static void appendGuardedLines(StringBuilder sb, @Nullable String guardCondition,
-                                   String guardIndent, String bodyIndent,
-                                   List<String> bodyLines) {
-        if (guardCondition != null) {
-            sb.append(guardIndent).append("if (").append(guardCondition).append(") {\n");
-        }
-        for (String line : bodyLines) {
-            sb.append(bodyIndent).append(line).append("\n");
-        }
-        if (guardCondition != null) {
-            sb.append(guardIndent).append("}\n");
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Shared resolution context — eliminates duplicate resolve blocks across
     // the two quick-fix classes.

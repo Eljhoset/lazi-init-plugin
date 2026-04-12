@@ -1108,6 +1108,8 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
         assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
         assertTrue("Guard condition must appear inside null-check",
                 result.contains("if (instanceObject != null)"));
+        assertTrue("Guard must appear inside the outer null-check",
+                result.indexOf("if (list == null)") < result.indexOf("if (instanceObject != null)"));
         assertTrue("Preamble declaration must be inside the guard",
                 result.indexOf("if (instanceObject != null)") < result.indexOf("String arg"));
         assertTrue("Assignment must be present", result.contains("list = arg + \"_suffix\""));
@@ -1115,8 +1117,7 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
     }
 
     /**
-     * DCL fix with an if-guard — the synchronized block's innermost body must contain
-     * {@code if (guard) { field = rhs; }}.
+     * DCL fix with an if-guard — the guard is placed inside the innermost null-check block.
      */
     public void testIfGuardPreservedInDclFix() {
         myFixture.configureByText("Bean.java", """
@@ -1144,11 +1145,12 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
         String result = myFixture.getFile().getText();
         assertFalse("init() must be removed", result.contains("void init()"));
         assertTrue("Field must be volatile", result.contains("volatile String list"));
+        assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
         assertTrue("synchronized block must be present", result.contains("synchronized (this)"));
         assertTrue("Guard condition must appear inside DCL block",
                 result.contains("if (instanceObject != null)"));
-        // Guard must be nested inside the inner null-check, which is inside synchronized
-        int syncIdx = result.indexOf("synchronized");
+        // Guard is nested inside the inner null-check, which is inside synchronized
+        int syncIdx  = result.indexOf("synchronized");
         int guardIdx = result.indexOf("if (instanceObject != null)");
         assertTrue("Guard must appear after synchronized", syncIdx < guardIdx);
         assertTrue("Assignment must be inside the guard", result.contains("list = \"value\""));

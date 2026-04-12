@@ -8,7 +8,6 @@ import com.intellij.psi.*;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -53,11 +52,12 @@ public class LazyInitQuickFix implements LocalQuickFix {
     static String buildNullCheckText(String fieldName, List<String> preamble, String rhsText,
                                      @Nullable String guardCondition) {
         StringBuilder sb = new StringBuilder("if (").append(fieldName).append(" == null) {\n");
-        List<String> body = new ArrayList<>(preamble);
-        body.add(fieldName + " = " + rhsText + ";");
-        LazyInitInspection.appendGuardedLines(sb, guardCondition, "    ", guardCondition != null ? "        " : "    ", body);
-        sb.append("}");
-        return sb.toString();
+        String indent = guardCondition != null ? "        " : "    ";
+        if (guardCondition != null) sb.append("    if (").append(guardCondition).append(") {\n");
+        for (String stmt : preamble) sb.append(indent).append(stmt).append("\n");
+        sb.append(indent).append(fieldName).append(" = ").append(rhsText).append(";\n");
+        if (guardCondition != null) sb.append("    }\n");
+        return sb.append("}").toString();
     }
 
     static void deleteCallSiteIfPresent(LazyInitInspection.FixContext ctx) {

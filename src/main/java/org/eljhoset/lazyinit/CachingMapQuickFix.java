@@ -89,9 +89,12 @@ public class CachingMapQuickFix implements LocalQuickFix {
                                       @Nullable String guardCondition) {
         StringBuilder sb = new StringBuilder("{\n");
         sb.append("    if (!").append(cacheName).append(".containsKey(").append(varyingFieldName).append(")) {\n");
-        java.util.List<String> body = new java.util.ArrayList<>(preamble);
-        body.add(cacheName + ".put(" + varyingFieldName + ", " + rhsText + ");");
-        LazyInitInspection.appendGuardedLines(sb, guardCondition, "        ", guardCondition != null ? "            " : "        ", body);
+        String indent = guardCondition != null ? "        " : "    ";
+        if (guardCondition != null) sb.append("        if (").append(guardCondition).append(") {\n");
+        for (String stmt : preamble) sb.append(indent).append("    ").append(stmt).append("\n");
+        sb.append(indent).append("    ").append(cacheName).append(".put(")
+                .append(varyingFieldName).append(", ").append(rhsText).append(");\n");
+        if (guardCondition != null) sb.append("        }\n");
         sb.append("    }\n");
         sb.append("    return ").append(cacheName).append(".get(").append(varyingFieldName).append(");\n");
         sb.append("}");

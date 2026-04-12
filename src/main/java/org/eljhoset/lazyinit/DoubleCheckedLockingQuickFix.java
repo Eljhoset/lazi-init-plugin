@@ -33,17 +33,23 @@ public class DoubleCheckedLockingQuickFix implements LocalQuickFix {
             debug("Marked field '" + ctx.fieldName() + "' as volatile");
         }
 
-        java.util.List<String> body = new java.util.ArrayList<>(ctx.preambleStatements());
-        body.add(ctx.fieldName() + " = " + ctx.effectiveRhsText() + ";");
-        StringBuilder innerSb = new StringBuilder();
-        LazyInitInspection.appendGuardedLines(innerSb, ctx.guardConditionText(), "            ", ctx.guardConditionText() != null ? "                " : "            ", body);
-        String innerBody = innerSb.toString();
+        String guard = ctx.guardConditionText();
+        StringBuilder preambleInner = new StringBuilder();
+        for (String stmt : ctx.preambleStatements()) {
+            preambleInner.append(guard != null ? "                " : "            ").append(stmt).append("\n");
+        }
+        preambleInner.append(guard != null ? "                " : "            ")
+                .append(ctx.fieldName()).append(" = ").append(ctx.effectiveRhsText()).append(";\n");
+
+        String innerBlock = guard != null
+                ? "            if (" + guard + ") {\n" + preambleInner + "            }\n"
+                : preambleInner.toString();
 
         PsiStatement dclStmt = ctx.factory().createStatementFromText(
                 "if (" + ctx.fieldName() + " == null) {\n"
                         + "    synchronized (this) {\n"
                         + "        if (" + ctx.fieldName() + " == null) {\n"
-                        + innerBody
+                        + innerBlock
                         + "        }\n"
                         + "    }\n"
                         + "}",
