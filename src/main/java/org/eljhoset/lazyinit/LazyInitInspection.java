@@ -116,6 +116,12 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             debugSkip(expression, "right-hand side mixes parameters and locals");
             return false;
         }
+        // A bare parameter assignment (field = param with no computation) inside a setter-named
+        // method (setXxx) is a setter pattern, not a lazy-init candidate — skip it.
+        if (profile.isBareParam() && isSetterMethod(hostMethod)) {
+            debugSkip(expression, "right-hand side is a bare parameter reference in a setter method");
+            return false;
+        }
         if (profile.hasLocal() && !allLocalsAreInlinable(profile.locals(), hostMethod, expression)) {
             debugSkip(expression, "right-hand side depends on non-inlinable locals " + namesOf(profile.locals()));
             return false;
@@ -143,7 +149,8 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
      * Classifies all reference expressions in an RHS expression in a single PSI walk,
      * avoiding separate repeated traversals for params, locals, and local collection.
      */
-    private record RhsProfile(boolean hasParam, boolean hasLocal, List<PsiLocalVariable> locals) {
+    private record RhsProfile(boolean hasParam, boolean hasLocal, List<PsiLocalVariable> locals,
+                               boolean isBareParam) {
         static RhsProfile of(PsiExpression rhs, PsiMethod scope) {
             boolean hasParam = false;
             boolean hasLocal = false;
@@ -161,7 +168,11 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                     locals.add(lv);
                 }
             }
-            return new RhsProfile(hasParam, hasLocal, locals);
+            // A bare param reference means the RHS IS the parameter with no wrapping computation.
+            boolean isBareParam = hasParam && !hasLocal
+                    && rhs instanceof PsiReferenceExpression ref
+                    && ref.resolve() instanceof PsiParameter;
+            return new RhsProfile(hasParam, hasLocal, locals, isBareParam);
         }
     }
 
@@ -235,6 +246,11 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         if (!(outerBlock instanceof PsiCodeBlock)) return null;
         if (!(outerBlock.getParent() instanceof PsiMethod method)) return null;
         return new HostContext(method, ifStmt);
+    }
+
+    private static boolean isSetterMethod(PsiMethod method) {
+        String name = method.getName();
+        return name.startsWith("set") && name.length() > 3 && Character.isUpperCase(name.charAt(3));
     }
 
     private static boolean isInThenBranch(PsiCodeBlock block, PsiIfStatement ifStmt) {

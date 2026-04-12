@@ -1184,6 +1184,35 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
         assertFalse("Fix must NOT be offered when guard condition references a local variable", hasLazyFix);
     }
 
+    /**
+     * A plain setter method (field = param with no computation) must NOT trigger the
+     * lazy-init inspection even when there is exactly one call site.
+     */
+    public void testSetterPatternNotHighlighted() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String filterOne;
+
+                    public void setFilterOne(String filterOne) {
+                        <caret>this.filterOne = filterOne;
+                    }
+
+                    public String getFilterOne() {
+                        return filterOne;
+                    }
+
+                    public void configure() {
+                        setFilterOne("value");
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f -> f.getText().contains("lazy initialization")
+                || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered for a plain setter (field = param)", hasLazyFix);
+    }
+
     // -----------------------------------------------------------------------
     // If/else guard: fallback branch preserved in generated getter
     // -----------------------------------------------------------------------
