@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -287,14 +288,21 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         PsiStatement assignStmt = PsiTreeUtil.getParentOfType(rhs, PsiStatement.class);
         if (body == null || assignStmt == null) return;
 
-        // Scan only within the current segment to avoid picking up varying fields
-        // from setter calls that belong to other assignments sharing the same local.
-        PsiStatement segmentStart = findSegmentStart(body, assignStmt, chainSet);
-        for (PsiStatement stmt : statementsInSegment(body, segmentStart, assignStmt)) {
-            if (isChainPreambleStatement(stmt, chainSet)) {
+        // Scan the declaration (constructor args may reference instance fields).
+        for (PsiStatement stmt : body.getStatements()) {
+            if (isDeclarationOfAny(stmt, chainSet)) {
                 for (PsiField f : collectInstanceFields(stmt, cls, assignedField)) {
                     if (!found.contains(f)) found.add(f);
                 }
+                break;
+            }
+        }
+
+        // Scan the effective setters — last call per (local, method) across ALL preceding
+        // segments — so constant setters from earlier segments are included.
+        for (PsiStatement stmt : effectiveSettersBefore(body, chainLocals, assignStmt)) {
+            for (PsiField f : collectInstanceFields(stmt, cls, assignedField)) {
+                if (!found.contains(f)) found.add(f);
             }
         }
     }
@@ -519,6 +527,32 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             if (active) result.add(stmt);
         }
         return result;
+    }
+
+    /**
+     * Returns the "effective" setter calls on any local in {@code locals} before
+     * {@code assignmentStmt} — the last call per {@code (local-name, method-name)} pair —
+     * ordered by last-occurrence position.
+     *
+     * <p>This captures constant setters (e.g. {@code argument.setFilterTwo("constant")})
+     * that appear only in an earlier segment: every segment's getter preamble must include
+     * them so the chain local is in the same state it was during the original init() call.
+     */
+    private static List<PsiStatement> effectiveSettersBefore(
+            PsiCodeBlock body, List<PsiLocalVariable> locals, PsiStatement assignmentStmt) {
+        LinkedHashMap<String, PsiStatement> lastByKey = new LinkedHashMap<>();
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt == assignmentStmt) break;
+            for (PsiLocalVariable local : locals) {
+                PsiMethodCallExpression call = getSetterCallOn(stmt, local);
+                if (call == null) continue;
+                String key = local.getName() + "." + call.getMethodExpression().getReferenceName();
+                lastByKey.remove(key); // re-insert at end to track last-occurrence order
+                lastByKey.put(key, stmt);
+                break;
+            }
+        }
+        return new ArrayList<>(lastByKey.values());
     }
 
     /**
@@ -751,10 +785,19 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                 }
             }
 
-            // Step B: segment-specific setters — always removed from init.
-            for (PsiStatement stmt : statementsInSegment(body, segmentStart, assignmentStmt)) {
-                if (!isDeclarationOfAny(stmt, localSet) && isPartOfBuildChain(stmt, locals)) {
-                    texts.add(stmt.getText());
+            // Step B: effective setters — last call per (receiver local, method-name) across ALL
+            // segments before this assignment, in last-occurrence order.
+            // Constant setters (called once before all segments, e.g. setFilterTwo) are included
+            // in the getter text but NOT added to preambleToRemove here — they will be removed
+            // from init when the segment that physically owns them is fixed, or by
+            // cleanupUnusedLocalDeclarations once no references remain.
+            Set<PsiStatement> segmentSetterSet = new HashSet<>(
+                    statementsInSegment(body, segmentStart, assignmentStmt).stream()
+                            .filter(s -> !isDeclarationOfAny(s, localSet) && isSetterCallOnAny(s, localSet))
+                            .toList());
+            for (PsiStatement stmt : effectiveSettersBefore(body, locals, assignmentStmt)) {
+                texts.add(stmt.getText());
+                if (segmentSetterSet.contains(stmt)) {
                     nodes.add(stmt);
                 }
             }

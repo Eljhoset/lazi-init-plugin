@@ -963,4 +963,74 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
         assertTrue("Assignment must be inside null-check", result.contains("result = sb.toString()"));
         assertTrue("Return must be preserved", result.contains("return result;"));
     }
+
+    /**
+     * A setter called only once before all segments (a "constant" setter) must be included
+     * in the preamble of every segment's getter, not just the first one.
+     * Here {@code argument.setFilterTwo("constant")} is called once and never overridden;
+     * only {@code setFilterOne} varies per segment.
+     */
+    public void testConstantSetterPreservedInLaterSegments() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String list;
+                    private String list2;
+                    private String list3;
+
+                    void init() {
+                        Arg argument = new Arg();
+                        argument.setFilterTwo("constant");
+                        argument.setFilterOne("one");
+                        list = doGet(argument);
+                        argument.setFilterOne("two");
+                        <caret>list2 = doGet(argument);
+                        argument.setFilterOne("three");
+                        list3 = doGet(argument);
+                    }
+
+                    String list(Arg a) { return a.one + a.two; }
+
+                    String doGet(Arg a) { return a.one + a.two; }
+
+                    String getList() {
+                        return list;
+                    }
+
+                    String getList2() {
+                        return list2;
+                    }
+
+                    String getList3() {
+                        return list3;
+                    }
+
+                    static class Arg {
+                        String one, two;
+                        void setFilterOne(String v) { one = v; }
+                        void setFilterTwo(String v) { two = v; }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for list2", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+
+        int getList2Start = result.indexOf("String getList2()");
+        int getList3Start = result.indexOf("String getList3()");
+        String getList2Text = result.substring(getList2Start, getList3Start);
+
+        assertTrue("getList2 null-check must be present", getList2Text.contains("if (list2 == null)"));
+        assertTrue("getList2 preamble must include the declaration",
+                getList2Text.contains("Arg argument = new Arg()"));
+        assertTrue("getList2 preamble must include the constant setter",
+                getList2Text.contains("argument.setFilterTwo(\"constant\")"));
+        assertTrue("getList2 preamble must include the segment-specific setter",
+                getList2Text.contains("argument.setFilterOne(\"two\")"));
+        assertFalse("getList2 preamble must NOT include segment-1 value of setFilterOne",
+                getList2Text.contains("argument.setFilterOne(\"one\")"));
+        assertTrue("getList2 must assign list2", getList2Text.contains("list2 = doGet(argument)"));
+    }
 }
