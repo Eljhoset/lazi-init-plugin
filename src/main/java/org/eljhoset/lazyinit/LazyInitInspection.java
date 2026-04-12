@@ -40,65 +40,24 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
 
     private static void checkAssignment(PsiAssignmentExpression expression, ProblemsHolder holder) {
         PsiField field = resolveToField(expression.getLExpression());
-        if (field == null) {
-            debugSkip(expression, "left-hand side does not resolve to a field");
-            return;
-        }
-        if (field.hasModifierProperty(PsiModifier.FINAL)) {
-            debugSkip(expression, "field '" + field.getName() + "' is final");
-            return;
-        }
-        if (field.getInitializer() != null) {
-            debugSkip(expression, "field '" + field.getName() + "' already has an initializer");
-            return;
-        }
+        if (field == null) { debugSkip(expression, "left-hand side does not resolve to a field"); return; }
+        if (!isEligibleField(field, expression)) return;
 
         PsiMethod hostMethod = getDirectHostMethod(expression);
-        if (hostMethod == null) {
-            debugSkip(expression, "assignment is not a direct statement in a method body");
-            return;
-        }
-        if (hostMethod.isConstructor()) {
-            debugSkip(expression, "host method '" + hostMethod.getName() + "' is a constructor");
-            return;
-        }
+        if (hostMethod == null) { debugSkip(expression, "assignment is not a direct statement in a method body"); return; }
+        if (hostMethod.isConstructor()) { debugSkip(expression, "host method '" + hostMethod.getName() + "' is a constructor"); return; }
 
         PsiMethod getter = findSimpleGetter(field);
-        if (getter == null) {
-            debugSkip(expression, "no simple getter found for field '" + field.getName() + "'");
-            return;
-        }
+        if (getter == null) { debugSkip(expression, "no simple getter found for field '" + field.getName() + "'"); return; }
 
         PsiExpression rhs = expression.getRExpression();
-        if (rhs == null) {
-            debugSkip(expression, "assignment has no right-hand side");
-            return;
-        }
+        if (rhs == null) { debugSkip(expression, "assignment has no right-hand side"); return; }
 
-        // Single pass over rhs: classify as having params, locals (or both), and collect the locals
         RhsProfile profile = RhsProfile.of(rhs, hostMethod);
-        if (profile.hasParam() && profile.hasLocal()) {
-            debugSkip(expression, "right-hand side mixes parameters and locals");
-            return;
-        }
-        if (profile.hasLocal() && !allLocalsAreInlinable(profile.locals(), hostMethod, expression)) {
-            debugSkip(expression, "right-hand side depends on non-inlinable locals " + namesOf(profile.locals()));
-            return;
-        }
+        if (!isEligibleRhsProfile(profile, hostMethod, expression)) return;
 
         Collection<PsiReference> hostRefs = ReferencesSearch.search(hostMethod).findAll();
-        if (profile.hasParam() && hostRefs.size() != 1) {
-            debugSkip(expression, "parameter-based rewrite requires exactly one call site, found " + hostRefs.size());
-            return;
-        }
-        if (profile.hasParam()) {
-            PsiMethodCallExpression callSite = PsiTreeUtil.getParentOfType(
-                    hostRefs.iterator().next().getElement(), PsiMethodCallExpression.class);
-            if (hasUnsafeLocalArgument(callSite)) {
-                debugSkip(expression, "single call site passes an argument that depends on caller-local state");
-                return;
-            }
-        }
+        if (!isParamCallSiteEligible(profile, hostRefs, expression)) return;
 
         List<PsiField> varyingFields = findVaryingFields(rhs, hostMethod, field);
         if (varyingFields.size() > 1) {
@@ -116,6 +75,47 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         holder.registerProblem(expression,
                 buildMessage(field, hostMethod.getName(), hostRefs.size()),
                 buildFixes(field, varyingField));
+    }
+
+    private static boolean isEligibleField(PsiField field, PsiAssignmentExpression expression) {
+        if (field.hasModifierProperty(PsiModifier.FINAL)) {
+            debugSkip(expression, "field '" + field.getName() + "' is final");
+            return false;
+        }
+        if (field.getInitializer() != null) {
+            debugSkip(expression, "field '" + field.getName() + "' already has an initializer");
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean isEligibleRhsProfile(RhsProfile profile, PsiMethod hostMethod,
+                                                 PsiAssignmentExpression expression) {
+        if (profile.hasParam() && profile.hasLocal()) {
+            debugSkip(expression, "right-hand side mixes parameters and locals");
+            return false;
+        }
+        if (profile.hasLocal() && !allLocalsAreInlinable(profile.locals(), hostMethod, expression)) {
+            debugSkip(expression, "right-hand side depends on non-inlinable locals " + namesOf(profile.locals()));
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean isParamCallSiteEligible(RhsProfile profile, Collection<PsiReference> hostRefs,
+                                                    PsiAssignmentExpression expression) {
+        if (!profile.hasParam()) return true;
+        if (hostRefs.size() != 1) {
+            debugSkip(expression, "parameter-based rewrite requires exactly one call site, found " + hostRefs.size());
+            return false;
+        }
+        PsiMethodCallExpression callSite = PsiTreeUtil.getParentOfType(
+                hostRefs.iterator().next().getElement(), PsiMethodCallExpression.class);
+        if (hasUnsafeLocalArgument(callSite)) {
+            debugSkip(expression, "single call site passes an argument that depends on caller-local state");
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -268,29 +268,36 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         if (cls == null) return List.of();
 
         List<PsiField> found = new ArrayList<>(collectInstanceFields(rhs, cls, assignedField));
+        collectChainPreambleFields(rhs, hostMethod, cls, assignedField, found);
+        return List.copyOf(found);
+    }
 
-        // When the RHS uses local variables, also scan the build-chain preamble statements
+    /** Scans the build-chain preamble of any locals in {@code rhs} and adds their referenced instance fields. */
+    private static void collectChainPreambleFields(PsiExpression rhs, PsiMethod hostMethod,
+                                                   PsiClass cls, PsiField assignedField,
+                                                   List<PsiField> found) {
         List<PsiLocalVariable> rhsLocals = findLocalVarsInExpr(rhs, hostMethod);
-        if (!rhsLocals.isEmpty()) {
-            List<PsiLocalVariable> chainLocals = collectBuildChainLocals(rhsLocals, hostMethod);
-            if (!chainLocals.isEmpty()) {
-                Set<PsiLocalVariable> chainSet = new HashSet<>(chainLocals);
-                PsiCodeBlock body = hostMethod.getBody();
-                PsiStatement assignStmt = PsiTreeUtil.getParentOfType(rhs, PsiStatement.class);
-                if (body != null) {
-                    for (PsiStatement stmt : body.getStatements()) {
-                        if (stmt != assignStmt
-                                && (isDeclarationOfAny(stmt, chainSet) || isSetterCallOnAny(stmt, chainSet))) {
-                            for (PsiField f : collectInstanceFields(stmt, cls, assignedField)) {
-                                if (!found.contains(f)) found.add(f);
-                            }
-                        }
-                    }
+        if (rhsLocals.isEmpty()) return;
+
+        List<PsiLocalVariable> chainLocals = collectBuildChainLocals(rhsLocals, hostMethod);
+        if (chainLocals.isEmpty()) return;
+
+        Set<PsiLocalVariable> chainSet = new HashSet<>(chainLocals);
+        PsiCodeBlock body = hostMethod.getBody();
+        PsiStatement assignStmt = PsiTreeUtil.getParentOfType(rhs, PsiStatement.class);
+        if (body == null) return;
+
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt != assignStmt && isChainPreambleStatement(stmt, chainSet)) {
+                for (PsiField f : collectInstanceFields(stmt, cls, assignedField)) {
+                    if (!found.contains(f)) found.add(f);
                 }
             }
         }
+    }
 
-        return List.copyOf(found);
+    private static boolean isChainPreambleStatement(PsiStatement stmt, Set<PsiLocalVariable> chainSet) {
+        return isDeclarationOfAny(stmt, chainSet) || isSetterCallOnAny(stmt, chainSet);
     }
 
     /**
