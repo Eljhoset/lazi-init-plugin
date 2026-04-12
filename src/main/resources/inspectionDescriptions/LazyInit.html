@@ -1,0 +1,89 @@
+<html>
+<body>
+Reports field assignments inside methods that can be moved into a lazy null-check initializer inside the field's getter.
+<!-- tooltip end -->
+<p>
+    When a field is assigned in a dedicated method and returned by a simple getter, the assignment can be
+    deferred to the first access. This removes the need to call the initializer method explicitly and
+    makes initialization transparent to callers.
+</p>
+<p>Two quick-fix variants are offered:</p>
+<ul>
+    <li>
+        <b>Simple lazy initialization</b> — adds a null-check guard before the return statement:
+<pre><code>
+String getName() {
+    if (name == null) {
+        name = computeName();
+    }
+    return name;
+}
+</code></pre>
+    </li>
+    <li>
+        <b>Thread-safe lazy initialization (double-checked locking)</b> — marks the field
+        <code>volatile</code> and wraps the assignment in a double-checked locking block:
+<pre><code>
+String getName() {
+    if (name == null) {
+        synchronized (this) {
+            if (name == null) {
+                name = computeName();
+            }
+        }
+    }
+    return name;
+}
+</code></pre>
+    </li>
+</ul>
+<p><b>Argument objects built before the call</b></p>
+<p>
+    When the right-hand side references a local variable constructed inline (e.g., a builder
+    or configuration object populated via setter calls), the inspection checks whether the entire
+    build chain depends only on instance fields, literals, or constants. If so, the declaration and
+    any setter calls are moved as a preamble into the null-check block together with the assignment:
+</p>
+<pre><code>
+// Before
+void init() {
+    StringBuilder sb = new StringBuilder();
+    sb.append(host);
+    service = sb.toString();
+}
+
+String getService() {
+    return service;
+}
+
+// After — the build chain moves into the getter
+String getService() {
+    if (service == null) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(host);
+        service = sb.toString();
+    }
+    return service;
+}
+</code></pre>
+<p>
+    The fix is suppressed when the build chain references another local variable (e.g., a local is
+    used as a setter argument), when the local is used in any statement other than its own build
+    chain and the assignment, or when the RHS mixes method parameters with local variables.
+</p>
+<p>
+    The host method is deleted automatically if it becomes empty after the assignment and its
+    preamble is removed. A warning is added to the problem description when the host method is
+    called from more than one site, since removing it may change observable behavior.
+</p>
+<p><b>Suppressed when:</b></p>
+<ul>
+    <li>The field already has a non-null initializer (e.g. <code>= new ArrayList&lt;&gt;()</code>).</li>
+    <li>The field is <code>final</code>.</li>
+    <li>The assignment is inside a constructor.</li>
+    <li>The getter body is not a simple <code>return field;</code> statement.</li>
+    <li>A local variable in the RHS has a build chain that references another local.</li>
+    <li>A local variable in the RHS is used in a statement outside its own build chain.</li>
+</ul>
+</body>
+</html>
