@@ -33,27 +33,7 @@ public class DoubleCheckedLockingQuickFix implements LocalQuickFix {
             debug("Marked field '" + ctx.fieldName() + "' as volatile");
         }
 
-        String guard = ctx.guardConditionText();
-        StringBuilder preambleInner = new StringBuilder();
-        for (String stmt : ctx.preambleStatements()) {
-            preambleInner.append(guard != null ? "                " : "            ").append(stmt).append("\n");
-        }
-        preambleInner.append(guard != null ? "                " : "            ")
-                .append(ctx.fieldName()).append(" = ").append(ctx.effectiveRhsText()).append(";\n");
-
-        String innerBlock = guard != null
-                ? "            if (" + guard + ") {\n" + preambleInner + "            }\n"
-                : preambleInner.toString();
-
-        PsiStatement dclStmt = ctx.factory().createStatementFromText(
-                "if (" + ctx.fieldName() + " == null) {\n"
-                        + "    synchronized (this) {\n"
-                        + "        if (" + ctx.fieldName() + " == null) {\n"
-                        + innerBlock
-                        + "        }\n"
-                        + "    }\n"
-                        + "}",
-                null);
+        PsiStatement dclStmt = ctx.factory().createStatementFromText(buildDclText(ctx), null);
 
         PsiCodeBlock getterBody = ctx.getter().getBody();
         if (getterBody == null) {
@@ -67,6 +47,50 @@ public class DoubleCheckedLockingQuickFix implements LocalQuickFix {
         LazyInitQuickFix.removeAssignmentAndCleanup(ctx.assignment(), ctx.hostMethod());
         if (ctx.hostMethod().isValid()) LazyInitQuickFix.cleanupUnusedLocalDeclarations(ctx.hostMethod());
         LazyInitQuickFix.deleteCallSiteIfPresent(ctx);
+        LazyInitQuickFix.deleteGuardIfStatementIfStillPresent(ctx);
+    }
+
+    /**
+     * Builds the DCL null-check text for the given fix context.
+     * When a guard if-statement is present and no parameter substitution is needed, the full
+     * if-statement is embedded verbatim inside the innermost null-check, so multi-statement
+     * then/else blocks are preserved exactly. Otherwise, the preamble and assignment are
+     * reconstructed with an optional guard condition and else-branch.
+     */
+    private static String buildDclText(LazyInitInspection.FixContext ctx) {
+        String fieldName = ctx.fieldName();
+        String outerCheck = "if (" + fieldName + " == null) {\n"
+                + "    synchronized (this) {\n"
+                + "        if (" + fieldName + " == null) {\n";
+        String outerClose = "        }\n    }\n}";
+
+        if (ctx.guardIfStatement() != null && ctx.callSiteToRemove() == null) {
+            return outerCheck + ctx.guardIfStatement().getText() + "\n" + outerClose;
+        }
+
+        String guard = ctx.guardConditionText();
+        String elseRhs = ctx.guardElseRhsText();
+        String innerIndent = guard != null ? "                " : "            ";
+        StringBuilder preambleInner = new StringBuilder();
+        for (String stmt : ctx.preambleStatements()) {
+            preambleInner.append(innerIndent).append(stmt).append("\n");
+        }
+        preambleInner.append(innerIndent).append(fieldName).append(" = ").append(ctx.effectiveRhsText()).append(";\n");
+
+        String innerBlock;
+        if (guard != null) {
+            StringBuilder ib = new StringBuilder("            if (").append(guard).append(") {\n")
+                    .append(preambleInner).append("            }");
+            if (elseRhs != null) {
+                ib.append(" else {\n")
+                  .append("                ").append(fieldName).append(" = ").append(elseRhs).append(";\n")
+                  .append("            }");
+            }
+            innerBlock = ib.append("\n").toString();
+        } else {
+            innerBlock = preambleInner.toString();
+        }
+        return outerCheck + innerBlock + outerClose;
     }
 
     private static void debug(String message) {

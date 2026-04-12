@@ -66,7 +66,7 @@ public class CachingMapQuickFix implements LocalQuickFix {
         // 2. Build and replace the getter body — the return statement changes, so a full
         //    body replacement is simpler and safer than inserting before the old return.
         String newBodyText = buildGetterBodyText(cacheName, varyingFieldName,
-                ctx.preambleStatements(), ctx.effectiveRhsText(), ctx.guardConditionText());
+                ctx.preambleStatements(), ctx.effectiveRhsText(), ctx.guardConditionText(), ctx.guardElseRhsText());
         PsiCodeBlock newBody = ctx.factory().createCodeBlockFromText(newBodyText, null);
 
         PsiCodeBlock getterBody = ctx.getter().getBody();
@@ -86,7 +86,7 @@ public class CachingMapQuickFix implements LocalQuickFix {
 
     static String buildGetterBodyText(String cacheName, String varyingFieldName,
                                       java.util.List<String> preamble, String rhsText,
-                                      @Nullable String guardCondition) {
+                                      @Nullable String guardCondition, @Nullable String guardElseRhsText) {
         StringBuilder sb = new StringBuilder("{\n");
         sb.append("    if (!").append(cacheName).append(".containsKey(").append(varyingFieldName).append(")) {\n");
         String indent = guardCondition != null ? "        " : "    ";
@@ -94,7 +94,16 @@ public class CachingMapQuickFix implements LocalQuickFix {
         for (String stmt : preamble) sb.append(indent).append("    ").append(stmt).append("\n");
         sb.append(indent).append("    ").append(cacheName).append(".put(")
                 .append(varyingFieldName).append(", ").append(rhsText).append(");\n");
-        if (guardCondition != null) sb.append("        }\n");
+        if (guardCondition != null) {
+            sb.append("        }");
+            if (guardElseRhsText != null) {
+                sb.append(" else {\n");
+                sb.append("            ").append(cacheName).append(".put(")
+                        .append(varyingFieldName).append(", ").append(guardElseRhsText).append(");\n");
+                sb.append("        }");
+            }
+            sb.append("\n");
+        }
         sb.append("    }\n");
         sb.append("    return ").append(cacheName).append(".get(").append(varyingFieldName).append(");\n");
         sb.append("}");

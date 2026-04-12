@@ -1183,4 +1183,329 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
                 || f.getText().contains("double-checked locking"));
         assertFalse("Fix must NOT be offered when guard condition references a local variable", hasLazyFix);
     }
+
+    // -----------------------------------------------------------------------
+    // If/else guard: fallback branch preserved in generated getter
+    // -----------------------------------------------------------------------
+
+    /**
+     * Simple lazy-init fix with an if/else guard — the full if/else is placed inside the
+     * null-check in the generated getter, and the host init() method is deleted.
+     */
+    public void testIfElseGuardPreservedInSimpleLazyInit() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.ArrayList;
+                import java.util.List;
+                public class Bean {
+                    private Object instanceObject;
+                    private List<String> list;
+
+                    void init() {
+                        if (instanceObject != null) {
+                            <caret>list = new ArrayList<>();
+                        } else {
+                            list = new ArrayList<>();
+                        }
+                    }
+
+                    List<String> getList() {
+                        return list;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Simple lazy-init fix must be offered for if/else guard pattern", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
+        assertTrue("Guard condition must appear inside null-check",
+                result.contains("if (instanceObject != null)"));
+        assertTrue("Else-branch must be preserved",
+                result.contains("} else {"));
+        assertTrue("Else-branch assignment must be present",
+                result.contains("list = new ArrayList<>()"));
+        assertTrue("Guard must appear inside outer null-check",
+                result.indexOf("if (list == null)") < result.indexOf("if (instanceObject != null)"));
+        assertTrue("Return must be preserved", result.contains("return list;"));
+    }
+
+    /**
+     * DCL fix with an if/else guard — the if/else is placed inside the innermost null-check
+     * of the synchronized block.
+     */
+    public void testIfElseGuardPreservedInDclFix() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.ArrayList;
+                import java.util.List;
+                public class Bean {
+                    private Object instanceObject;
+                    private List<String> list;
+
+                    void init() {
+                        if (instanceObject != null) {
+                            <caret>list = new ArrayList<>();
+                        } else {
+                            list = new ArrayList<>();
+                        }
+                    }
+
+                    List<String> getList() {
+                        return list;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to thread-safe lazy initialization (double-checked locking)");
+        assertNotNull("DCL fix must be offered for if/else guard pattern", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Field must be volatile", result.contains("volatile"));
+        assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
+        assertTrue("synchronized block must be present", result.contains("synchronized (this)"));
+        assertTrue("Guard condition must appear inside DCL block",
+                result.contains("if (instanceObject != null)"));
+        assertTrue("Else-branch must be preserved", result.contains("} else {"));
+        int syncIdx  = result.indexOf("synchronized");
+        int guardIdx = result.indexOf("if (instanceObject != null)");
+        assertTrue("Guard must appear after synchronized", syncIdx < guardIdx);
+        assertTrue("Return must be preserved", result.contains("return list;"));
+    }
+
+    /**
+     * Simple lazy-init fix with an if/else guard and a build-chain preamble in the then-branch.
+     * The preamble is moved into the getter; the else-branch fallback is preserved.
+     */
+    public void testIfElseGuardPreservedWithBuildChain() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object instanceObject;
+                    private String list;
+
+                    void init() {
+                        if (instanceObject != null) {
+                            String prefix = "val";
+                            <caret>list = prefix + "_suffix";
+                        } else {
+                            list = "default";
+                        }
+                    }
+
+                    String getList() {
+                        return list;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered with preamble inside if/else guard", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
+        assertTrue("Guard condition must appear inside null-check",
+                result.contains("if (instanceObject != null)"));
+        assertTrue("Preamble must be inside the guard",
+                result.indexOf("if (instanceObject != null)") < result.indexOf("String prefix"));
+        assertTrue("Else-branch must be preserved", result.contains("} else {"));
+        assertTrue("Else assignment must be present", result.contains("list = \"default\""));
+        assertTrue("Return must be preserved", result.contains("return list;"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-statement blocks (then and/or else contain side-effect statements)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Else-block has multiple statements (side-effect calls surrounding the fallback
+     * assignment). The entire if/else must be copied verbatim into the getter.
+     */
+    public void testIfElseMultiStatementElsePreserved() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.ArrayList;
+                import java.util.List;
+                public class Bean {
+                    private Object instanceObject;
+                    private List<String> list;
+                    private final Service service = new Service();
+
+                    void init() {
+                        if (instanceObject != null) {
+                            <caret>list = service.getList();
+                        } else {
+                            System.out.println("fallback start");
+                            list = new ArrayList<>();
+                            System.out.println("fallback done");
+                        }
+                    }
+
+                    List<String> getList() {
+                        return list;
+                    }
+
+                    static class Service {
+                        List<String> getList() { return new ArrayList<>(); }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for multi-statement else block", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (list == null)"));
+        assertTrue("Guard condition must appear inside null-check",
+                result.contains("if (instanceObject != null)"));
+        assertTrue("Else-branch must be preserved", result.contains("} else {"));
+        assertTrue("Else side-effect statement must be preserved",
+                result.contains("System.out.println"));
+        assertTrue("Else fallback assignment must be present", result.contains("list = new ArrayList<>()"));
+        assertTrue("Return must be preserved", result.contains("return list;"));
+    }
+
+    /**
+     * Else-block has a build-chain (local declaration + setter call) in addition to the
+     * fallback field assignment and side-effect calls.
+     */
+    public void testIfElseMultiStatementElseBuildChain() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.List;
+                public class Bean {
+                    private Object instanceObject;
+                    private List<String> list;
+                    private final Service service = new Service();
+
+                    void init() {
+                        if (instanceObject != null) {
+                            <caret>list = service.getList("main");
+                        } else {
+                            System.out.println("fallback");
+                            list = service.getList("fallback");
+                        }
+                    }
+
+                    List<String> getList() {
+                        return list;
+                    }
+
+                    static class Service {
+                        List<String> getList(String key) { return null; }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for multi-statement else with println", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Null-check must be present", result.contains("if (list == null)"));
+        assertTrue("Guard must be preserved", result.contains("if (instanceObject != null)"));
+        assertTrue("Else-branch must be present", result.contains("} else {"));
+        assertTrue("Else println must be preserved", result.contains("System.out.println"));
+        assertTrue("Else assignment must be present", result.contains("service.getList(\"fallback\")"));
+    }
+
+    /**
+     * Both then-block and else-block have side-effect statements surrounding the assignments.
+     * The entire if/else must be preserved verbatim in the getter.
+     */
+    public void testIfElseMultiStatementBothBranches() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.ArrayList;
+                import java.util.List;
+                public class Bean {
+                    private Object instanceObject;
+                    private List<String> list;
+                    private final Service service = new Service();
+
+                    void init() {
+                        if (instanceObject != null) {
+                            System.out.println("before");
+                            <caret>list = service.getList();
+                            System.out.println("after");
+                        } else {
+                            System.out.println("fallback");
+                            list = new ArrayList<>();
+                        }
+                    }
+
+                    List<String> getList() {
+                        return list;
+                    }
+
+                    static class Service {
+                        List<String> getList() { return new ArrayList<>(); }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when then-block has statements before and after assignment", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be removed", result.contains("void init()"));
+        assertTrue("Null-check must be present", result.contains("if (list == null)"));
+        assertTrue("Guard must be preserved", result.contains("if (instanceObject != null)"));
+        // Both the pre-assignment and post-assignment println must be in the getter
+        assertTrue("Pre-assignment side-effect must be in getter", result.contains("System.out.println(\"before\")"));
+        assertTrue("Post-assignment side-effect must be in getter", result.contains("System.out.println(\"after\")"));
+        assertTrue("Else-branch must be present", result.contains("} else {"));
+        assertTrue("Return must be preserved", result.contains("return list;"));
+    }
+
+    /**
+     * In a direct (non-guarded) init method, a chain local is referenced by a side-effect
+     * statement AFTER the field assignment.  The fix must copy the declaration to the getter
+     * but keep it in init() so the post-assignment statement remains valid.
+     */
+    public void testDirectMethodLocalUsedAfterAssignment() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String list;
+                    private final Service service = new Service();
+
+                    void init() {
+                        System.out.println("start");
+                        String arg = "hello";
+                        <caret>list = service.compute(arg);
+                        System.out.println("arg was: " + arg);
+                    }
+
+                    String getList() {
+                        return list;
+                    }
+
+                    static class Service {
+                        String compute(String s) { return s; }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered even when local is used after the assignment", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        // init() must NOT be removed because it still has side-effect statements
+        assertTrue("init() must be kept since it still has side-effect work", result.contains("void init()"));
+        // The getter must have the null-check with the preamble
+        assertTrue("Null-check must be present in getter", result.contains("if (list == null)"));
+        assertTrue("Preamble declaration must appear in getter", result.contains("String arg"));
+        assertTrue("Assignment must be inside null-check",
+                result.indexOf("if (list == null)") < result.indexOf("list = service.compute(arg)"));
+        // init() must still compile: the declaration must be kept so println(arg) is valid
+        assertTrue("Declaration must be kept in init() for post-assignment use",
+                result.contains("void init()") && result.contains("System.out.println(\"arg was: \" + arg)"));
+    }
 }

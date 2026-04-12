@@ -61,6 +61,12 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             debugSkip(expression, "guard condition references local variables — cannot move to getter");
             return;
         }
+        if (hostCtx.guardIfStatement() != null
+                && hostCtx.guardIfStatement().getElseBranch() != null
+                && !isValidElseBranch(hostCtx.guardIfStatement(), field, hostMethod)) {
+            debugSkip(expression, "else-branch is not a simple field assignment eligible for lazy init");
+            return;
+        }
 
         PsiMethod getter = findSimpleGetter(field);
         if (getter == null) { debugSkip(expression, "no simple getter found for field '" + field.getName() + "'"); return; }
@@ -167,7 +173,7 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         if (effectiveBody == null) return false;
         List<PsiLocalVariable> chainLocals = collectBuildChainLocals(locals, effectiveBody, hostMethod);
         // All chain locals must be declared inside the effective body.
-        // If a local is declared in the outer method body (and assignment is if-wrapped), the
+        // If a local is declared in the outer method body (and the assignment is if-wrapped), the
         // declaration cannot be copied into the getter preamble, so we block the fix.
         for (PsiLocalVariable lv : chainLocals) {
             if (!PsiTreeUtil.isAncestor(effectiveBody, lv, false)) {
@@ -223,11 +229,21 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
 
         // If-wrapped case: PsiCodeBlock → PsiBlockStatement → PsiIfStatement → PsiCodeBlock → PsiMethod
         PsiIfStatement ifStmt = resolveEnclosingIfStatement(blockParent);
-        if (ifStmt == null || ifStmt.getElseBranch() != null) return null;
+        if (ifStmt == null) return null;
+        if (!isInThenBranch((PsiCodeBlock) block, ifStmt)) return null;
         PsiElement outerBlock = ifStmt.getParent();
         if (!(outerBlock instanceof PsiCodeBlock)) return null;
         if (!(outerBlock.getParent() instanceof PsiMethod method)) return null;
         return new HostContext(method, ifStmt);
+    }
+
+    private static boolean isInThenBranch(PsiCodeBlock block, PsiIfStatement ifStmt) {
+        PsiStatement then = ifStmt.getThenBranch();
+        if (then == null) return false;
+        // Layout 1 (common): PsiCodeBlock wrapped in PsiBlockStatement
+        if (then instanceof PsiBlockStatement bs && bs.getCodeBlock() == block) return true;
+        // Layout 2 (rare): PsiCodeBlock directly as then-branch
+        return then == block;
     }
 
     /**
@@ -244,6 +260,26 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             return i;
         }
         return null;
+    }
+
+    private static boolean isValidElseBranch(PsiIfStatement guardIf, PsiField field, PsiMethod hostMethod) {
+        PsiStatement elseBranch = guardIf.getElseBranch();
+        if (!(elseBranch instanceof PsiBlockStatement bs)) return false;
+        // Else-block must contain exactly one assignment to the target field (other side effect
+        // statements are allowed and will be preserved verbatim in the generated getter).
+        // The field assignment's RHS must not depend on host-method parameters.
+        PsiAssignmentExpression fieldAssign = null;
+        for (PsiStatement stmt : bs.getCodeBlock().getStatements()) {
+            if (stmt instanceof PsiExpressionStatement es
+                    && es.getExpression() instanceof PsiAssignmentExpression a
+                    && resolveToField(a.getLExpression()) == field) {
+                if (fieldAssign != null) return false; // more than one
+                fieldAssign = a;
+            }
+        }
+        if (fieldAssign == null) return false;
+        PsiExpression elseRhs = fieldAssign.getRExpression();
+        return elseRhs == null || !referencesParam(elseRhs, hostMethod);
     }
 
     /**
@@ -368,14 +404,12 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         Set<PsiLocalVariable> chainSet = new HashSet<>(chainLocals);
 
         // Scan the declaration (constructor args may reference instance fields).
-        for (PsiStatement stmt : body.getStatements()) {
-            if (isDeclarationOfAny(stmt, chainSet)) {
-                for (PsiField f : collectInstanceFields(stmt, cls, assignedField)) {
-                    if (!found.contains(f)) found.add(f);
-                }
-                break;
-            }
-        }
+        Arrays.stream(body.getStatements())
+                .filter(s -> isDeclarationOfAny(s, chainSet))
+                .findFirst()
+                .ifPresent(s -> collectInstanceFields(s, cls, assignedField).stream()
+                        .filter(f -> !found.contains(f))
+                        .forEach(found::add));
 
         // Scan the effective setters — last call per (local, method) across ALL preceding
         // segments — so constant setters from earlier segments are included.
@@ -543,6 +577,26 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
     }
 
     /**
+     * Returns {@code true} when any local in {@code locals} is referenced by a statement
+     * that appears AFTER {@code assignmentStmt} in {@code body}.
+     * Used in {@link FixContext#collectPreamble} to decide whether the declaration should be
+     * kept in the host method after the fix, so post-assignment side effect statements can
+     * still use the local (e.g. {@code System.out.println(argument)} after the field assignment).
+     */
+    private static boolean isAnyLocalReferencedAfterAssignment(PsiCodeBlock body,
+                                                                Set<PsiLocalVariable> locals,
+                                                                PsiStatement assignmentStmt) {
+        boolean pastAssignment = false;
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt == assignmentStmt) { pastAssignment = true; continue; }
+            if (pastAssignment && locals.stream().anyMatch(lv -> containsReferenceToLocal(stmt, lv))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Returns all statements in {@code body} that appear before {@code upToExclusive}
      * (pass {@code null} to scan the entire body), are assignments to a {@link PsiField},
      * and whose RHS references at least one local in {@code chainLocals}.
@@ -616,11 +670,12 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             if (stmt == assignmentStmt) break;
             for (PsiLocalVariable local : locals) {
                 PsiMethodCallExpression call = getSetterCallOn(stmt, local);
-                if (call == null) continue;
-                String key = local.getName() + "." + call.getMethodExpression().getReferenceName();
-                lastByKey.remove(key); // re-insert at end to track last-occurrence order
-                lastByKey.put(key, stmt);
-                break;
+                if (call != null) {
+                    String key = local.getName() + "." + call.getMethodExpression().getReferenceName();
+                    lastByKey.remove(key); // re-insert at end to track last-occurrence order
+                    lastByKey.put(key, stmt);
+                    break;
+                }
             }
         }
         return new ArrayList<>(lastByKey.values());
@@ -743,13 +798,17 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             List<String> preambleStatements,
             List<PsiStatement> preambleToRemove,
             @Nullable PsiField varyingField,
-            @Nullable String guardConditionText
+            @Nullable String guardConditionText,
+            @Nullable PsiIfStatement guardIfStatement
     ) {
         /** Derived — never stored separately. */
         String fieldName() { return field.getName(); }
 
         /** Derived — never stored separately. */
         PsiElementFactory factory() { return JavaPsiFacade.getElementFactory(field.getProject()); }
+
+        /** Derived from {@link #guardIfStatement()} — returns the RHS text of a single-statement else-branch. */
+        @Nullable String guardElseRhsText() { return extractElseRhsText(guardIfStatement()); }
 
         static @Nullable FixContext from(@NotNull ProblemDescriptor descriptor) {
             PsiAssignmentExpression assignment = (PsiAssignmentExpression) descriptor.getPsiElement();
@@ -804,10 +863,22 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                     assignment, field, hostMethod, getter,
                     effectiveRhsText, callSiteToRemove,
                     preamble.texts(), preamble.nodes(), varyingField,
-                    hostCtx.guardConditionText());
+                    hostCtx.guardConditionText(), hostCtx.guardIfStatement());
         }
 
         // -- helpers kept private to FixContext --------------------------------
+
+        private static @Nullable String extractElseRhsText(@Nullable PsiIfStatement guardIf) {
+            if (guardIf == null) return null;
+            PsiStatement elseBranch = guardIf.getElseBranch();
+            if (!(elseBranch instanceof PsiBlockStatement bs)) return null;
+            PsiStatement[] stmts = bs.getCodeBlock().getStatements();
+            if (stmts.length != 1) return null;
+            if (!(stmts[0] instanceof PsiExpressionStatement exprStmt)) return null;
+            if (!(exprStmt.getExpression() instanceof PsiAssignmentExpression assign)) return null;
+            PsiExpression rhs = assign.getRExpression();
+            return rhs == null ? null : rhs.getText();
+        }
 
         private record ParamSubstitution(String rhsText,
                                          @Nullable PsiExpressionStatement callSiteToRemove) {}
@@ -837,29 +908,39 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             if (body == null) return Preamble.EMPTY;
             List<PsiLocalVariable> locals = collectBuildChainLocals(findLocalVarsInExpr(rhs, hostMethod), body, hostMethod);
             if (locals.isEmpty()) return Preamble.EMPTY;
+            return buildPreamble(body, assignmentStmt, locals);
+        }
 
+        private static Preamble buildPreamble(PsiCodeBlock body, PsiStatement assignmentStmt,
+                                              List<PsiLocalVariable> locals) {
             Set<PsiLocalVariable> localSet = new HashSet<>(locals);
             PsiStatement segmentStart = findSegmentStart(body, assignmentStmt, localSet);
 
-            // In the multi-assignment pattern, the local's declaration is shared across segments.
-            // It must be copied into each getter's null-check text but kept in init until all
-            // assignments are converted (at which point cleanupUnusedLocalDeclarations removes it).
-            // In the single-assignment case, the declaration belongs to preambleToRemove as before.
+            // The declaration must be kept in init (not deleted) in two cases:
+            // 1. Multi-assignment: shared local used by several field assignments — kept until all are fixed.
+            // 2. Local used after assignment: e.g. System.out.println(argument) after list = svc.get(argument).
+            //    Deleting the declaration would leave a dangling reference in the host method.
             boolean isMultiAssignment = findPeerFieldAssignmentsBefore(body, localSet, null)
                     .stream().anyMatch(s -> s != assignmentStmt);
+            boolean isLocalUsedAfterAssignment = isAnyLocalReferencedAfterAssignment(body, localSet, assignmentStmt);
+            // Declaration stays in init if shared across multiple assignments OR used after the assignment.
+            // Segment-specific setters stay in init only when the local is used after the assignment
+            // AND it is not a multi-assignment — in the multi-assignment case the setters are
+            // segment-specific and belong in the getter, not in init.
+            boolean keepDeclarationInInit = isMultiAssignment || isLocalUsedAfterAssignment;
+            boolean keepSettersInInit = isLocalUsedAfterAssignment && !isMultiAssignment;
 
             List<String> texts = new ArrayList<>();
             List<PsiStatement> nodes = new ArrayList<>();
 
-            // Step A: declaration — always copied into getter; deleted from init only for single-assignment.
             for (PsiStatement stmt : body.getStatements()) {
                 if (isDeclarationOfAny(stmt, localSet)) {
                     texts.add(stmt.getText());
-                    if (!isMultiAssignment) nodes.add(stmt);
+                    if (!keepDeclarationInInit) nodes.add(stmt);
                 }
             }
 
-            // Step B: effective setters — last call per (receiver local, method-name) across ALL
+            // Effective setters: last call per (receiver local, method-name) across ALL
             // segments before this assignment, in last-occurrence order.
             // Constant setters (called once before all segments, e.g. setFilterTwo) are included
             // in the getter text but NOT added to preambleToRemove here — they will be removed
@@ -869,11 +950,13 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                     statementsInSegment(body, segmentStart, assignmentStmt).stream()
                             .filter(s -> !isDeclarationOfAny(s, localSet) && isSetterCallOnAny(s, localSet))
                             .toList());
+            // Setters that are segment-specific and safe to remove from init.
+            // keepSettersInInit is true when the local is used after the assignment — removing
+            // its setters would corrupt the state that post-assignment statements depend on.
+            Set<PsiStatement> removableSetters = keepSettersInInit ? Set.of() : segmentSetterSet;
             for (PsiStatement stmt : effectiveSettersBefore(body, locals, assignmentStmt)) {
                 texts.add(stmt.getText());
-                if (segmentSetterSet.contains(stmt)) {
-                    nodes.add(stmt);
-                }
+                if (removableSetters.contains(stmt)) nodes.add(stmt);
             }
 
             return new Preamble(texts, nodes);

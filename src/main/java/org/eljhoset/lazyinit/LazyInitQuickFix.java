@@ -30,10 +30,16 @@ public class LazyInitQuickFix implements LocalQuickFix {
         debug("Applying lazy-init quick fix for field '" + ctx.fieldName() + "' at "
                 + LazyInitInspection.describeElement(ctx.assignment()));
 
-        PsiStatement ifStmt = ctx.factory().createStatementFromText(
-                buildNullCheckText(ctx.fieldName(), ctx.preambleStatements(), ctx.effectiveRhsText(),
-                        ctx.guardConditionText()),
-                null);
+        // When a guard if-statement is present (with or without else), copy it verbatim into the
+        // null-check so that all surrounding statements (side effect calls, multi-statement
+        // else-blocks, etc.) are preserved exactly as written.  For the no-guard case use the
+        // traditional preamble + assignment reconstruction.
+        String nullCheckText = ctx.guardIfStatement() != null && ctx.callSiteToRemove() == null
+                ? "if (" + ctx.fieldName() + " == null) {\n" + ctx.guardIfStatement().getText() + "\n}"
+                : buildNullCheckText(ctx.fieldName(), ctx.preambleStatements(), ctx.effectiveRhsText(),
+                        ctx.guardConditionText(), ctx.guardElseRhsText());
+
+        PsiStatement ifStmt = ctx.factory().createStatementFromText(nullCheckText, null);
 
         PsiCodeBlock getterBody = ctx.getter().getBody();
         if (getterBody == null) {
@@ -47,17 +53,48 @@ public class LazyInitQuickFix implements LocalQuickFix {
         removeAssignmentAndCleanup(ctx.assignment(), ctx.hostMethod());
         if (ctx.hostMethod().isValid()) cleanupUnusedLocalDeclarations(ctx.hostMethod());
         deleteCallSiteIfPresent(ctx);
+        deleteGuardIfStatementIfStillPresent(ctx);
     }
 
     static String buildNullCheckText(String fieldName, List<String> preamble, String rhsText,
-                                     @Nullable String guardCondition) {
+                                     @Nullable String guardCondition, @Nullable String guardElseRhsText) {
         StringBuilder sb = new StringBuilder("if (").append(fieldName).append(" == null) {\n");
         String indent = guardCondition != null ? "        " : "    ";
         if (guardCondition != null) sb.append("    if (").append(guardCondition).append(") {\n");
         for (String stmt : preamble) sb.append(indent).append(stmt).append("\n");
         sb.append(indent).append(fieldName).append(" = ").append(rhsText).append(";\n");
-        if (guardCondition != null) sb.append("    }\n");
+        if (guardCondition != null) {
+            sb.append("    }");
+            if (guardElseRhsText != null) {
+                sb.append(" else {\n");
+                sb.append("        ").append(fieldName).append(" = ").append(guardElseRhsText).append(";\n");
+                sb.append("    }");
+            }
+            sb.append("\n");
+        }
         return sb.append("}").toString();
+    }
+
+    /**
+     * Deletes the guard if-statement from the host method when it is still present after the
+     * normal assignment-cleanup pass.  This is needed when the then-block has extra statements
+     * (e.g., side effect calls) that prevent the empty-block detection from firing, but the
+     * full if-statement was already copied verbatim to the getter.
+     */
+    static void deleteGuardIfStatementIfStillPresent(LazyInitInspection.FixContext ctx) {
+        PsiIfStatement guardIf = ctx.guardIfStatement();
+        if (guardIf == null || !guardIf.isValid()) return;
+        PsiElement prev = guardIf.getPrevSibling();
+        if (prev instanceof PsiWhiteSpace) prev.delete();
+        guardIf.delete();
+        debug("Deleted remaining guard if-statement from host method '" + ctx.hostMethod().getName() + "'");
+        if (!ctx.hostMethod().isValid()) return;
+        PsiCodeBlock hostBody = ctx.hostMethod().getBody();
+        if (hostBody != null && hostBody.getStatements().length == 0) {
+            PsiElement prevMethod = ctx.hostMethod().getPrevSibling();
+            if (prevMethod instanceof PsiWhiteSpace) prevMethod.delete();
+            ctx.hostMethod().delete();
+        }
     }
 
     static void deleteCallSiteIfPresent(LazyInitInspection.FixContext ctx) {
@@ -75,20 +112,22 @@ public class LazyInitQuickFix implements LocalQuickFix {
 
     static void removeAssignmentAndCleanup(PsiAssignmentExpression assignment, PsiMethod hostMethod) {
         PsiElement assignStmt = assignment.getParent(); // PsiExpressionStatement
-        // Capture the containing block before deleting the statement.
+        // Capture the containing block and any enclosing if-guard before deleting the statement.
         PsiElement containingBlock = assignStmt.getParent();
+        PsiIfStatement guardIf = (containingBlock instanceof PsiCodeBlock cb)
+                ? LazyInitInspection.resolveEnclosingIfStatement(cb.getParent()) : null;
+        boolean hasElse = guardIf != null && guardIf.getElseBranch() != null;
         assignStmt.delete();
         debug("Removed original assignment from host method '" + hostMethod.getName() + "'");
 
-        // Guard if-statements containing only the assignment become orphaned after removal; clean them up.
-        if (containingBlock instanceof PsiCodeBlock cb && cb.getStatements().length == 0) {
-            PsiIfStatement guardIf = LazyInitInspection.resolveEnclosingIfStatement(cb.getParent());
-            if (guardIf != null) {
-                PsiElement prev = guardIf.getPrevSibling();
-                if (prev instanceof PsiWhiteSpace) prev.delete();
-                guardIf.delete();
-                debug("Deleted now-empty if-guard from host method '" + hostMethod.getName() + "'");
-            }
+        // Guard if-statements become orphaned after the assignment is removed; clean them up.
+        // For if/else: delete the entire statement immediately (else-branch has already been
+        // moved to the getter). For if-only: delete only when the then-block is now empty.
+        if (containingBlock instanceof PsiCodeBlock cb && guardIf != null && (hasElse || cb.getStatements().length == 0)) {
+            PsiElement prev = guardIf.getPrevSibling();
+            if (prev instanceof PsiWhiteSpace) prev.delete();
+            guardIf.delete();
+            debug("Deleted if-guard from host method '" + hostMethod.getName() + "'");
         }
 
         PsiCodeBlock hostBody = hostMethod.getBody();
