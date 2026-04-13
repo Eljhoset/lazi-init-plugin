@@ -10,8 +10,43 @@
 
     <rule ref="category/java/design.xml/CognitiveComplexity">
         <properties>
-            <property name="methodReportLevel" value="15" />
-            <property name="classReportLevel" value="50" />
+            <!-- PMD reports at or above the configured threshold; Sonar S3776 reports above 15. -->
+            <property name="reportLevel" value="16" />
+        </properties>
+    </rule>
+
+    <rule
+        name="OneBreakOrContinuePerLoop"
+        language="java"
+        message="Loops should not contain more than a single break or continue statement."
+        class="net.sourceforge.pmd.lang.rule.xpath.XPathRule">
+        <description>
+            Implements Sonar rule java:S135 by reporting loops that contain more than
+            one break or continue statement for that loop. Nested loops and switch
+            statements are ignored so only the control flow of the current loop is counted.
+        </description>
+        <priority>3</priority>
+        <properties>
+            <property name="xpath">
+                <value><![CDATA[
+//(ForStatement | ForeachStatement | WhileStatement | DoStatement)
+    [
+        let $loop := .
+        return count(
+            .//(BreakStatement | ContinueStatement)
+                [
+                    ancestor::*[
+                        self::ForStatement
+                        or self::ForeachStatement
+                        or self::WhileStatement
+                        or self::DoStatement
+                        or self::SwitchStatement
+                    ][1] is $loop
+                ]
+        ) > 1
+    ]
+                ]]></value>
+            </property>
         </properties>
     </rule>
 </ruleset>
