@@ -30,24 +30,33 @@ public class LazyInitQuickFix implements LocalQuickFix {
         debug("Applying lazy-init quick fix for field '" + ctx.fieldName() + "' at "
                 + LazyInitInspection.describeElement(ctx.assignment()));
 
-        // When a guard if-statement is present (with or without else), copy it verbatim into the
-        // null-check so that all surrounding statements (side effect calls, multi-statement
-        // else-blocks, etc.) are preserved exactly as written.  For the no-guard case use the
-        // traditional preamble + assignment reconstruction.
-        String nullCheckText = ctx.guardIfStatement() != null && ctx.callSiteToRemove() == null
-                ? "if (" + ctx.fieldName() + " == null) {\n" + ctx.guardIfStatement().getText() + "\n}"
-                : buildNullCheckText(ctx.fieldName(), ctx.preambleStatements(), ctx.effectiveRhsText(),
-                        ctx.guardConditionText(), ctx.guardElseRhsText());
+        if (!ctx.getterAlreadyLazy()) {
+            // When a guard if-statement is present (with or without else), copy it verbatim into
+            // the null-check so that all surrounding statements (side effect calls, multi-statement
+            // else-blocks, etc.) are preserved exactly as written.  For the no-guard case use the
+            // traditional preamble + assignment reconstruction.
+            // Use the verbatim copy path only when there is a real guard condition to preserve.
+            // When guardConditionText is null the guard was suppressed (e.g. it was already the
+            // field's own null-check), so fall through to buildNullCheckText for a clean single check.
+            String nullCheckText = ctx.guardIfStatement() != null
+                                    && ctx.guardConditionText() != null
+                                    && ctx.callSiteToRemove() == null
+                    ? "if (" + ctx.fieldName() + " == null) {\n" + ctx.guardIfStatement().getText() + "\n}"
+                    : buildNullCheckText(ctx.fieldName(), ctx.preambleStatements(), ctx.effectiveRhsText(),
+                            ctx.guardConditionText(), ctx.guardElseRhsText());
 
-        PsiStatement ifStmt = ctx.factory().createStatementFromText(nullCheckText, null);
+            PsiStatement ifStmt = ctx.factory().createStatementFromText(nullCheckText, null);
 
-        PsiCodeBlock getterBody = ctx.getter().getBody();
-        if (getterBody == null) {
-            debug("Aborting lazy-init quick fix because getter body is missing for '" + ctx.getter().getName() + "'");
-            return;
+            PsiCodeBlock getterBody = ctx.getter().getBody();
+            if (getterBody == null) {
+                debug("Aborting lazy-init quick fix because getter body is missing for '" + ctx.getter().getName() + "'");
+                return;
+            }
+            getterBody.addBefore(ifStmt, getterBody.getStatements()[0]);
+            debug("Inserted lazy-init null-check into getter '" + ctx.getter().getName() + "'");
+        } else {
+            debug("Getter already has lazy init for field '" + ctx.fieldName() + "' — skipping getter modification");
         }
-        getterBody.addBefore(ifStmt, getterBody.getStatements()[0]);
-        debug("Inserted lazy-init null-check into getter '" + ctx.getter().getName() + "'");
 
         deletePreamble(ctx.preambleToRemove());
         removeAssignmentAndCleanup(ctx.assignment(), ctx.hostMethod());

@@ -27,6 +27,13 @@ import java.util.stream.Stream;
 
 public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
     private static final Logger LOG = Logger.getInstance(LazyInitInspection.class);
+    private static final String IN_METHOD = "' in method '";
+
+    /** Key expression and its type name for selector-based caching getters. */
+    record KeyExprInfo(String keyExprText, String keyTypeName) {}
+
+    /** Resolved getter method and whether it already contains the lazy-init null-check. */
+    private record GetterInfo(PsiMethod getter, boolean alreadyLazy) {}
 
     /** Identifies the host method and any enclosing if-guard for an assignment. */
     record HostContext(@NotNull PsiMethod method, @Nullable PsiIfStatement guardIfStatement) {
@@ -56,20 +63,30 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         if (hostCtx == null) { debugSkip(expression, "assignment is not in an eligible position"); return; }
         PsiMethod hostMethod = hostCtx.method();
         if (hostMethod.isConstructor()) { debugSkip(expression, "host method '" + hostMethod.getName() + "' is a constructor"); return; }
-        if (hostCtx.guardIfStatement() != null
-                && !isGuardConditionMovable(hostCtx.guardIfStatement(), hostMethod)) {
-            debugSkip(expression, "guard condition references local variables — cannot move to getter");
+        // Try simple getter first; fall back to lazy getter (getter already has null-check).
+        GetterInfo getterInfo = resolveGetterInfo(field);
+        if (getterInfo == null) {
+            debugSkip(expression, "no simple or lazy getter found for field '" + field.getName() + "'");
             return;
         }
-        if (hostCtx.guardIfStatement() != null
-                && hostCtx.guardIfStatement().getElseBranch() != null
-                && !isValidElseBranch(hostCtx.guardIfStatement(), field, hostMethod)) {
-            debugSkip(expression, "else-branch is not a simple field assignment eligible for lazy init");
+        PsiMethod getter = getterInfo.getter();
+        boolean getterAlreadyLazy = getterInfo.alreadyLazy();
+
+        // When the getter already owns the lazy initialisation, the fix only removes the
+        // assignment (and its preamble) from the host method — nothing is inserted into the
+        // getter.  Guard/param/varying-field validation is not needed in this path.
+        if (getterAlreadyLazy) {
+            Collection<PsiReference> lazyHostRefs = ReferencesSearch.search(hostMethod).findAll();
+            debug("Registering lazy-init removal for field '" + field.getName() + IN_METHOD
+                    + hostMethod.getName() + "' at " + describeElement(expression)
+                    + " (getter already has lazy init), callSites=" + lazyHostRefs.size());
+            holder.registerProblem(expression,
+                    buildMessage(field, hostMethod.getName(), lazyHostRefs.size()),
+                    new LazyInitQuickFix());
             return;
         }
 
-        PsiMethod getter = findSimpleGetter(field);
-        if (getter == null) { debugSkip(expression, "no simple getter found for field '" + field.getName() + "'"); return; }
+        if (!isGuardEligibleForMoving(hostCtx, field, hostMethod, expression)) return;
 
         PsiExpression rhs = expression.getRExpression();
         if (rhs == null) { debugSkip(expression, "assignment has no right-hand side"); return; }
@@ -88,7 +105,11 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         }
         PsiField varyingField = varyingFields.size() == 1 ? varyingFields.getFirst() : null;
 
-        debug("Registering lazy-init inspection for field '" + field.getName() + "' in method '"
+        if (varyingField != null && checkSelectorPattern(field, varyingField, hostMethod, rhs, hostRefs, expression, holder)) {
+            return;
+        }
+
+        debug("Registering lazy-init inspection for field '" + field.getName() + IN_METHOD
                 + hostMethod.getName() + "' at " + describeElement(expression)
                 + " with getter '" + getter.getName() + "' and callSites=" + hostRefs.size()
                 + " varyingField=" + (varyingField != null ? varyingField.getName() : "none"));
@@ -96,6 +117,22 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         holder.registerProblem(expression,
                 buildMessage(field, hostMethod.getName(), hostRefs.size()),
                 buildFixes(field, varyingField));
+    }
+
+    private static boolean isGuardEligibleForMoving(HostContext hostCtx, PsiField field,
+                                                      PsiMethod hostMethod,
+                                                      PsiAssignmentExpression expression) {
+        PsiIfStatement guard = hostCtx.guardIfStatement();
+        if (guard == null) return true;
+        if (!isGuardConditionMovable(guard, hostMethod)) {
+            debugSkip(expression, "guard condition references local variables — cannot move to getter");
+            return false;
+        }
+        if (guard.getElseBranch() != null && !isValidElseBranch(guard, field, hostMethod)) {
+            debugSkip(expression, "else-branch is not a simple field assignment eligible for lazy init");
+            return false;
+        }
+        return true;
     }
 
     private static boolean isEligibleField(PsiField field, PsiAssignmentExpression expression) {
@@ -140,6 +177,10 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                 hostRefs.iterator().next().getElement(), PsiMethodCallExpression.class);
         if (hasUnsafeLocalArgument(callSite)) {
             debugSkip(expression, "single call site passes an argument that depends on caller-local state");
+            return false;
+        }
+        if (isCallSiteInConditional(callSite)) {
+            debugSkip(expression, "single call site is inside a conditional — the field may never be initialized");
             return false;
         }
         return true;
@@ -195,6 +236,14 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         return isMovableBuildChain(chainLocals, hostMethod, assignmentStmt);
     }
 
+    /** Resolves a simple or lazy getter for {@code field}, or returns {@code null} if none exists. */
+    private static @Nullable GetterInfo resolveGetterInfo(PsiField field) {
+        PsiMethod getter = findSimpleGetter(field);
+        if (getter != null) return new GetterInfo(getter, false);
+        getter = findLazyGetter(field);
+        return getter != null ? new GetterInfo(getter, true) : null;
+    }
+
     private static LocalQuickFix[] buildFixes(PsiField field, @Nullable PsiField varyingField) {
         if (varyingField != null) {
             return new LocalQuickFix[]{new CachingMapQuickFix(varyingField)};
@@ -203,6 +252,167 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             return new LocalQuickFix[]{new LazyInitQuickFix()};
         }
         return new LocalQuickFix[]{new LazyInitQuickFix(), new DoubleCheckedLockingQuickFix()};
+    }
+
+    /**
+     * Handles the selector-method pattern: when the varying field is assigned in the host
+     * method before the target assignment, we look for a null-case companion and register a
+     * {@link SelectorLazyGetterQuickFix}.
+     *
+     * @return {@code true} when the pattern was detected (regardless of whether a fix was
+     *         offered), so the caller can skip the fallthrough to {@link #buildFixes}.
+     */
+    private static boolean checkSelectorPattern(PsiField field, PsiField varyingField, PsiMethod hostMethod,
+                                                 PsiExpression rhs, Collection<PsiReference> hostRefs,
+                                                 PsiAssignmentExpression expression, ProblemsHolder holder) {
+        if (!isVaryingFieldAssignedBefore(varyingField, hostMethod, expression)) return false;
+        PsiAssignmentExpression nullCase = findNullCaseAssignment(field, varyingField);
+        if (nullCase == null) {
+            debugSkip(expression, "selector-method pattern — no null-case companion found");
+            return true;
+        }
+        KeyExprInfo key = extractEffectiveKey(rhs, varyingField);
+        String keyExpr = key != null ? key.keyExprText() : varyingField.getName();
+        String keyType = key != null ? key.keyTypeName() : boxedTypeName(varyingField.getType(), expression);
+        PsiMethod nullCaseMethod = PsiTreeUtil.getParentOfType(nullCase, PsiMethod.class);
+        if (nullCaseMethod == null) {
+            debugSkip(expression, "selector-method pattern — could not resolve null-case method");
+            return true;
+        }
+        debug("Registering selector lazy-getter fix for field '" + field.getName()
+                + "' keyed by '" + keyExpr + "'");
+        holder.registerProblem(expression,
+                buildMessage(field, hostMethod.getName(), hostRefs.size()),
+                new SelectorLazyGetterQuickFix(varyingField.getName(),
+                        nullCaseMethod.getName(), keyExpr, keyType));
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Selector-based lazy getter helpers
+    // -----------------------------------------------------------------------
+
+    /** Boxes a primitive type to its wrapper class name (simple name — no {@code java.lang.} prefix). */
+    static String boxedTypeName(PsiType type, PsiElement context) {
+        if (type instanceof PsiPrimitiveType pt) {
+            PsiClassType boxed = pt.getBoxedType(context);
+            if (boxed != null) {
+                String canonical = boxed.getCanonicalText();
+                // java.lang wrapper types don't need an import — use simple name directly
+                return canonical.startsWith("java.lang.") ? canonical.substring("java.lang.".length()) : canonical;
+            }
+            return switch (pt.getCanonicalText()) {
+                case "int"     -> "Integer";
+                case "long"    -> "Long";
+                case "double"  -> "Double";
+                case "float"   -> "Float";
+                case "boolean" -> "Boolean";
+                case "byte"    -> "Byte";
+                case "short"   -> "Short";
+                case "char"    -> "Character";
+                default        -> pt.getCanonicalText();
+            };
+        }
+        return type.getCanonicalText();
+    }
+
+    /**
+     * Returns {@code true} when {@code varyingField} is the LHS of a simple assignment
+     * statement that appears before the statement containing {@code targetAssignment} in
+     * {@code hostMethod}'s body.
+     */
+    static boolean isVaryingFieldAssignedBefore(PsiField varyingField, PsiMethod hostMethod,
+                                                 PsiAssignmentExpression targetAssignment) {
+        PsiCodeBlock body = hostMethod.getBody();
+        if (body == null) return false;
+        PsiStatement assignmentStmt = PsiTreeUtil.getParentOfType(targetAssignment, PsiStatement.class);
+        if (assignmentStmt == null) return false;
+        // Walk up to the direct child of body (handles if-guarded assignments)
+        PsiElement topLevel = assignmentStmt;
+        while (topLevel.getParent() != body) {
+            PsiElement next = topLevel.getParent();
+            if (next == null || next instanceof PsiMethod) return false;
+            topLevel = next;
+        }
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt == topLevel) break;
+            if (isDirectAssignmentTo(stmt, varyingField)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isDirectAssignmentTo(PsiStatement stmt, PsiField field) {
+        if (!(stmt instanceof PsiExpressionStatement exprStmt)) return false;
+        PsiExpression expr = exprStmt.getExpression();
+        if (!(expr instanceof PsiAssignmentExpression assign)) return false;
+        return resolveToField(assign.getLExpression()) == field;
+    }
+
+    /**
+     * Scans class methods for a "null-case" companion: a non-constructor, non-guarded
+     * assignment to {@code target} whose RHS references neither {@code varyingField} nor
+     * any method parameters nor any other varying instance field.
+     */
+    static @Nullable PsiAssignmentExpression findNullCaseAssignment(PsiField target, PsiField varyingField) {
+        PsiClass cls = target.getContainingClass();
+        if (cls == null) return null;
+        for (PsiMethod method : cls.getMethods()) {
+            if (method.isConstructor()) continue;
+            PsiAssignmentExpression found = findNullCaseInMethod(method, target, varyingField);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static @Nullable PsiAssignmentExpression findNullCaseInMethod(PsiMethod method,
+                                                                           PsiField target,
+                                                                           PsiField varyingField) {
+        PsiCodeBlock body = method.getBody();
+        if (body == null) return null;
+        for (PsiStatement stmt : body.getStatements()) {
+            PsiAssignmentExpression candidate = extractNullCaseCandidate(stmt, method, target, varyingField);
+            if (candidate != null) return candidate;
+        }
+        return null;
+    }
+
+    private static @Nullable PsiAssignmentExpression extractNullCaseCandidate(PsiStatement stmt,
+                                                                                @NotNull PsiMethod method,
+                                                                                @NotNull PsiField target,
+                                                                                @NotNull PsiField varyingField) {
+        if (!(stmt instanceof PsiExpressionStatement exprStmt)) return null;
+        if (!(exprStmt.getExpression() instanceof PsiAssignmentExpression assign)) return null;
+        if (resolveToField(assign.getLExpression()) != target) return null;
+        PsiExpression rhs = assign.getRExpression();
+        if (rhs == null) return null;
+        boolean refsVarying = allReferenceExpressions(rhs).stream().anyMatch(ref -> ref.resolve() == varyingField);
+        if (refsVarying || referencesParam(rhs, method)) return null;
+        if (!findVaryingFields(rhs, method, target).isEmpty()) return null;
+        return assign;
+    }
+
+    /**
+     * Extracts the effective cache key when {@code varyingField} appears exactly once in
+     * {@code rhs} as the receiver of a no-arg, non-void method call.
+     * E.g. for {@code service.compute(this.entity.getId())} with {@code varyingField=entity},
+     * returns {@code KeyExprInfo("this.entity.getId()", "Long")}.
+     */
+    static @Nullable KeyExprInfo extractEffectiveKey(PsiExpression rhs, PsiField varyingField) {
+        List<PsiReferenceExpression> refs = allReferenceExpressions(rhs).stream()
+                .filter(ref -> ref.resolve() == varyingField)
+                .toList();
+        if (refs.size() != 1) return null;
+        PsiReferenceExpression varyingRef = refs.getFirst();
+        PsiElement refParent = varyingRef.getParent();
+        if (!(refParent instanceof PsiReferenceExpression)) return null;
+        PsiElement callParent = refParent.getParent();
+        if (!(callParent instanceof PsiMethodCallExpression call)) return null;
+        if (call.getArgumentList().getExpressions().length != 0) return null;
+        PsiElement resolved = call.getMethodExpression().resolve();
+        if (!(resolved instanceof PsiMethod calledMethod)) return null;
+        PsiType returnType = calledMethod.getReturnType();
+        if (returnType == null || "void".equals(returnType.getCanonicalText())) return null;
+        return new KeyExprInfo(call.getText(), boxedTypeName(returnType, rhs));
     }
 
     // -----------------------------------------------------------------------
@@ -235,6 +445,11 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
 
         // Direct case: code block is the method body
         if (blockParent instanceof PsiMethod method) {
+            // If any preceding if-statement has a return branch the assignment is conditionally
+            // guarded by an early return — moving it to the getter would make it unconditional.
+            if (hasEarlyReturnGuardBefore((PsiCodeBlock) block, (PsiStatement) exprStmt)) {
+                return null;
+            }
             return new HostContext(method, null);
         }
 
@@ -306,8 +521,16 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         PsiExpression condition = guardIfStatement.getCondition();
         if (condition == null) return false;
         for (PsiReferenceExpression ref : allReferenceExpressions(condition)) {
-            if (ref.resolve() instanceof PsiLocalVariable lv
+            PsiElement resolved = ref.resolve();
+            if (resolved instanceof PsiLocalVariable lv
                     && PsiTreeUtil.isAncestor(hostMethod, lv, true)) {
+                return false;
+            }
+            // A parameter reference in the guard condition cannot be moved to the getter —
+            // after parameter substitution the guard text would still contain the parameter
+            // name, which is undefined in the getter scope (compile error).
+            if (resolved instanceof PsiParameter p
+                    && PsiTreeUtil.isAncestor(hostMethod, p, true)) {
                 return false;
             }
         }
@@ -341,6 +564,47 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         PsiExpression retExpr = ret.getReturnValue();
         if (!(retExpr instanceof PsiReferenceExpression retRef)) return false;
         return fieldName.equals(retRef.getReferenceName());
+    }
+
+    /**
+     * Finds a getter for {@code field} that already contains a lazy-init null-check:
+     * <pre>
+     *     ReturnType getField() {
+     *         if (field == null) { … }
+     *         return field;
+     *     }
+     * </pre>
+     * Criteria: no parameters; body has ≥ 2 statements; first statement is
+     * {@code if (field == null) {…}}; last statement is {@code return field;}.
+     */
+    static @Nullable PsiMethod findLazyGetter(PsiField field) {
+        PsiClass cls = field.getContainingClass();
+        if (cls == null) return null;
+        String fieldName = field.getName();
+        String capitalized = capitalize(fieldName);
+        return Stream.of("get" + capitalized, "is" + capitalized)
+                .map(name -> cls.findMethodsByName(name, false))
+                .flatMap(Arrays::stream)
+                .filter(method -> isBodyLazyReturn(method, fieldName))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static boolean isBodyLazyReturn(PsiMethod m, String fieldName) {
+        if (!m.getParameterList().isEmpty()) return false;
+        PsiCodeBlock body = m.getBody();
+        if (body == null) return false;
+        PsiStatement[] stmts = body.getStatements();
+        if (stmts.length < 2) return false;
+        PsiStatement lastStmt = stmts[stmts.length - 1];
+        if (!(lastStmt instanceof PsiReturnStatement ret)) return false;
+        PsiExpression retExpr = ret.getReturnValue();
+        if (!(retExpr instanceof PsiReferenceExpression retRef)) return false;
+        if (!fieldName.equals(retRef.getReferenceName())) return false;
+        if (!(stmts[0] instanceof PsiIfStatement ifStmt)) return false;
+        PsiExpression condition = ifStmt.getCondition();
+        if (condition == null) return false;
+        return condition.getText().trim().equals(fieldName + " == null");
     }
 
     /**
@@ -393,7 +657,7 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
      * the three cases: 0 → standard null-check fixes apply; 1 → caching-map fix applies;
      * 2+ → no fix should be offered (composite key not supported).
      */
-    static List<PsiField> findVaryingFields(PsiExpression rhs, PsiMethod hostMethod, PsiField assignedField) {
+    static @NotNull List<PsiField> findVaryingFields(PsiExpression rhs, PsiMethod hostMethod, PsiField assignedField) {
         PsiClass cls = assignedField.getContainingClass();
         if (cls == null) return List.of();
 
@@ -815,7 +1079,8 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             List<PsiStatement> preambleToRemove,
             @Nullable PsiField varyingField,
             @Nullable String guardConditionText,
-            @Nullable PsiIfStatement guardIfStatement
+            @Nullable PsiIfStatement guardIfStatement,
+            boolean getterAlreadyLazy
     ) {
         /** Derived — never stored separately. */
         String fieldName() { return field.getName(); }
@@ -840,11 +1105,13 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                 return null;
             }
             PsiMethod hostMethod = hostCtx.method();
-            PsiMethod getter = findSimpleGetter(field);
-            if (getter == null) {
-                debug("Cannot build fix context: getter for field '" + field.getName() + "' is no longer simple");
+            GetterInfo getterInfo = resolveGetterInfo(field);
+            if (getterInfo == null) {
+                debug("Cannot build fix context: no simple or lazy getter found for field '" + field.getName() + "'");
                 return null;
             }
+            PsiMethod getter = getterInfo.getter();
+            boolean getterAlreadyLazy = getterInfo.alreadyLazy();
             PsiExpression rhs = assignment.getRExpression();
             if (rhs == null) {
                 debug("Cannot build fix context: assignment has no right-hand side at " + describeElement(assignment));
@@ -864,7 +1131,7 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                             + "' to rhs '" + summarizeText(effectiveRhsText) + "'");
                 } else {
                     debug("No parameter substitution available for field '" + field.getName()
-                            + "' in method '" + hostMethod.getName() + "'");
+                            + IN_METHOD + hostMethod.getName() + "'");
                 }
             } else if (referencesLocalVar(rhs, hostMethod)) {
                 PsiStatement assignmentStmt = PsiTreeUtil.getParentOfType(assignment, PsiStatement.class);
@@ -875,11 +1142,20 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
 
             PsiField varyingField = findVaryingField(rhs, hostMethod, field);
 
+            // When the guard condition is already a null-check on the target field
+            // (e.g. "name == null"), the outer null-check in the getter is identical.
+            // Pass null for the guard text so the fix generates a single null-check,
+            // but keep the guardIfStatement reference so it is still cleaned up.
+            String guardCondText = hostCtx.guardConditionText();
+            if (isRedundantNullCheckGuard(guardCondText, field.getName())) {
+                guardCondText = null;
+            }
+
             return new FixContext(
                     assignment, field, hostMethod, getter,
                     effectiveRhsText, callSiteToRemove,
                     preamble.texts(), preamble.nodes(), varyingField,
-                    hostCtx.guardConditionText(), hostCtx.guardIfStatement());
+                    guardCondText, hostCtx.guardIfStatement(), getterAlreadyLazy);
         }
 
         // -- helpers kept private to FixContext --------------------------------
@@ -978,6 +1254,77 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
             return new Preamble(texts, nodes);
         }
 
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard / call-site safety helpers
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns {@code true} when the guard condition text is already a null-check on the target
+     * field (e.g. {@code "name == null"} or {@code "null == name"}).  Embedding such a condition
+     * inside the outer null-check would produce a redundant double check.
+     */
+    private static boolean isRedundantNullCheckGuard(@Nullable String conditionText, String fieldName) {
+        if (conditionText == null) return false;
+        String stripped = conditionText.strip();
+        return stripped.equals(fieldName + " == null") || stripped.equals("null == " + fieldName);
+    }
+
+    /**
+     * Returns {@code true} when any {@link PsiIfStatement} that appears <em>before</em>
+     * {@code assignmentStmt} in {@code body} has an unconditional {@code return} statement in
+     * one of its branches.  Such a statement acts as an early-return guard: the assignment only
+     * runs when the early-return condition is false, so moving it to the getter would make it
+     * unconditional.
+     */
+    private static boolean hasEarlyReturnGuardBefore(PsiCodeBlock body, PsiStatement assignmentStmt) {
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt == assignmentStmt) break;
+            if (stmt instanceof PsiIfStatement ifStmt && ifStmtHasReturnBranch(ifStmt)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean ifStmtHasReturnBranch(PsiIfStatement ifStmt) {
+        return isSingleReturnStatement(ifStmt.getThenBranch())
+                || isSingleReturnStatement(ifStmt.getElseBranch());
+    }
+
+    private static boolean isSingleReturnStatement(@Nullable PsiStatement stmt) {
+        if (stmt instanceof PsiReturnStatement) return true;
+        if (stmt instanceof PsiBlockStatement bs) {
+            PsiStatement[] stmts = bs.getCodeBlock().getStatements();
+            return stmts.length == 1 && stmts[0] instanceof PsiReturnStatement;
+        }
+        return false;
+    }
+
+    /**
+     * Returns {@code true} when {@code call} is nested inside a conditional construct
+     * (if-statement, ternary, loop, or switch) within its containing method.  A guarded call
+     * site means the field might never be initialized if the condition is never true.
+     */
+    private static boolean isCallSiteInConditional(@Nullable PsiMethodCallExpression call) {
+        if (call == null) return true;
+        PsiMethod callerMethod = PsiTreeUtil.getParentOfType(call, PsiMethod.class);
+        if (callerMethod == null) return true;
+        PsiElement parent = call.getParent();
+        while (parent != null && parent != callerMethod) {
+            if (parent instanceof PsiIfStatement
+                    || parent instanceof PsiConditionalExpression
+                    || parent instanceof PsiWhileStatement
+                    || parent instanceof PsiForStatement
+                    || parent instanceof PsiForeachStatement
+                    || parent instanceof PsiSwitchStatement
+                    || parent instanceof PsiDoWhileStatement) {
+                return true;
+            }
+            parent = parent.getParent();
+        }
+        return false;
     }
 
     static void debug(String message) {

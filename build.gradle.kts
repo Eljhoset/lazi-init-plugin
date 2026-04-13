@@ -1,5 +1,8 @@
+import org.gradle.api.plugins.quality.Pmd
+
 plugins {
     id("java")
+    id("pmd")
     alias(libs.plugins.kotlin)
     alias(libs.plugins.intellijPlatform)
 }
@@ -17,6 +20,13 @@ repositories {
     intellijPlatform {
         defaultRepositories()
     }
+}
+
+pmd {
+    toolVersion = "7.18.0"
+    isConsoleOutput = true
+    ruleSetFiles = files(layout.projectDirectory.file("config/pmd/ruleset.xml"))
+    ruleSets = emptyList()
 }
 
 // Read more: https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin.html
@@ -45,6 +55,13 @@ intellijPlatform {
 }
 
 tasks {
+    withType<Pmd>().configureEach {
+        reports {
+            xml.required = true
+            html.required = true
+        }
+    }
+
     test {
         useJUnit()
     }

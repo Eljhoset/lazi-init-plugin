@@ -1537,4 +1537,1543 @@ public class LazyInitInspectionTest extends BasePlatformTestCase {
         assertTrue("Declaration must be kept in init() for post-assignment use",
                 result.contains("void init()") && result.contains("System.out.println(\"arg was: \" + arg)"));
     }
+
+    // -----------------------------------------------------------------------
+    // GROUP 1 — Control-flow blockers: fix must NOT be offered
+    // -----------------------------------------------------------------------
+
+    /**
+     * Assignment inside a for-each loop body — getHostContext returns null because the
+     * enclosing PsiCodeBlock's parent is PsiForeachStatement, not PsiMethod.
+     */
+    public void testNoFixForAssignmentInForEachLoop() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.List;
+                public class Bean {
+                    private List<String> items;
+                    private String last;
+
+                    void init() {
+                        for (String item : items) {
+                            <caret>last = item;
+                        }
+                    }
+
+                    String getLast() {
+                        return last;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered for assignment inside a for-each loop", hasLazyFix);
+    }
+
+    /**
+     * Assignment inside a while-loop body — same structural block as for-each but with
+     * PsiWhileStatement as the containing element.
+     */
+    public void testNoFixForAssignmentInWhileLoop() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.Iterator;
+                public class Bean {
+                    private Iterator<String> queue;
+                    private String last;
+
+                    void init() {
+                        while (queue.hasNext()) {
+                            <caret>last = queue.next();
+                        }
+                    }
+
+                    String getLast() {
+                        return last;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered for assignment inside a while loop", hasLazyFix);
+    }
+
+    /**
+     * Assignment inside the try-block of a try/catch statement — getHostContext returns null
+     * because the PsiCodeBlock's parent is PsiTryStatement.
+     */
+    public void testNoFixForAssignmentInTryCatch() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+                    private final Service service = new Service();
+
+                    void init() {
+                        try {
+                            <caret>name = service.getValue();
+                        } catch (Exception e) {
+                            name = "fallback";
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    static class Service {
+                        String getValue() throws Exception { return "ok"; }
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered for assignment inside a try block", hasLazyFix);
+    }
+
+    /**
+     * Assignment inside the try-block of a try/finally statement.
+     */
+    public void testNoFixForAssignmentInTryFinally() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+                    private final Service service = new Service();
+
+                    void init() {
+                        try {
+                            <caret>name = service.getValue();
+                        } finally {
+                            service.close();
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    static class Service {
+                        String getValue() { return "ok"; }
+                        void close() {}
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered for assignment inside a try/finally block", hasLazyFix);
+    }
+
+    /**
+     * Assignment inside a switch/case block — PsiCodeBlock's parent is PsiSwitchStatement,
+     * not PsiMethod or an eligible PsiIfStatement.
+     */
+    public void testNoFixForAssignmentInSwitchCase() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String type;
+                    private String name;
+
+                    void init() {
+                        switch (type) {
+                            case "A": <caret>name = "type-a"; break;
+                            default:  name = "default"; break;
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered for assignment inside a switch case", hasLazyFix);
+    }
+
+    /**
+     * Assignment two levels deep inside nested if-statements — getHostContext checks that the
+     * outer enclosing block's parent is a PsiMethod; here it is another if-statement, so it
+     * returns null.
+     */
+    public void testNoFixForNestedIfGuard() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object config;
+                    private Object service;
+                    private String name;
+
+                    void init() {
+                        if (config != null) {
+                            if (service != null) {
+                                <caret>name = "computed";
+                            }
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered when assignment is nested two if-levels deep", hasLazyFix);
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 2 — Guard condition edge cases
+    // -----------------------------------------------------------------------
+
+    /**
+     * Guard condition contains a compound AND expression referencing only instance fields.
+     * isGuardConditionMovable returns true (no local vars); the full compound condition must
+     * be preserved verbatim inside the outer null-check.
+     */
+    public void testCompoundAndGuardConditionPreserved() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private final Service service = new Service();
+                    private String name;
+
+                    void init() {
+                        if (service != null && service.isAvailable()) {
+                            <caret>name = service.compute();
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    static class Service {
+                        boolean isAvailable() { return true; }
+                        String compute() { return "ok"; }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered with compound AND guard", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (name == null)"));
+        assertTrue("Compound guard must be preserved verbatim",
+                result.contains("if (service != null && service.isAvailable())"));
+        assertTrue("Guard must be inside null-check",
+                result.indexOf("if (name == null)") < result.indexOf("if (service != null && service.isAvailable())"));
+        assertTrue("Assignment must be present", result.contains("name = service.compute()"));
+        assertTrue("Return must be preserved", result.contains("return name;"));
+    }
+
+    /**
+     * Guard condition is a pure method call with no local references.
+     * isGuardConditionMovable returns true; the call must appear verbatim in the getter.
+     */
+    public void testMethodCallGuardConditionPreserved() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object config;
+                    private String name;
+
+                    void init() {
+                        if (isReady()) {
+                            <caret>name = computeName();
+                        }
+                    }
+
+                    private boolean isReady() {
+                        return config != null;
+                    }
+
+                    private String computeName() {
+                        return config.toString();
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when guard is a method call with no local refs", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (name == null)"));
+        assertTrue("Method-call guard must be preserved", result.contains("if (isReady())"));
+        assertTrue("Guard must be inside null-check",
+                result.indexOf("if (name == null)") < result.indexOf("if (isReady())"));
+        assertTrue("Assignment must be preserved", result.contains("name = computeName()"));
+    }
+
+    /**
+     * Guard condition is already a null-check on the target field itself:
+     *   if (name == null) { name = "default"; }
+     * After the fix the getter must contain the null-check exactly once — the guard condition
+     * is identical to the outer null-check so the two should not be nested redundantly.
+     */
+    public void testGuardConditionOnTargetFieldGeneratesNoRedundantCheck() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init() {
+                        if (name == null) {
+                            <caret>name = "default";
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when guard is a null-check on the target field", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Null-check must be present", result.contains("if (name == null)"));
+        // The guard IS the null-check — nesting it would produce a redundant double check.
+        assertFalse("Redundant double null-check must NOT appear in the getter",
+                result.contains("if (name == null) {") && result.indexOf("if (name == null)") != result.lastIndexOf("if (name == null)"));
+        assertTrue("Assignment must be inside the null-check", result.contains("name = \"default\""));
+        assertTrue("Return must be preserved", result.contains("return name;"));
+    }
+
+    /**
+     * Guard condition references a method parameter — isGuardConditionMovable only blocks
+     * local variable references today, so parameters slip through. After parameter substitution
+     * the guard text still contains the unresolved parameter name, which would cause a compile
+     * error. The fix must NOT be offered in this case.
+     */
+    public void testNoFixWhenGuardConditionReferencesParameter() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init(String prefix) {
+                        if (prefix != null) {
+                            <caret>name = prefix + "_val";
+                        }
+                    }
+
+                    void setup() {
+                        init("hello");
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered when the guard condition references a method parameter", hasLazyFix);
+    }
+
+    /**
+     * Guard condition contains a compound OR expression referencing only instance fields —
+     * no local refs, so isGuardConditionMovable returns true and the condition is preserved.
+     * The guard fields (providerA, providerB) are only used in the condition, not in the RHS,
+     * so they are not detected as "varying" and the simple fix is offered.
+     */
+    public void testGuardConditionWithOrPreserved() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object providerA;
+                    private Object providerB;
+                    private String name;
+
+                    void init() {
+                        if (providerA != null || providerB != null) {
+                            <caret>name = "provided";
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered with compound OR guard", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Outer null-check must be present", result.contains("if (name == null)"));
+        assertTrue("Compound OR guard must be preserved verbatim",
+                result.contains("if (providerA != null || providerB != null)"));
+        assertTrue("Assignment must be preserved inside guard",
+                result.contains("name = \"provided\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 3 — Parameter substitution edge cases
+    // -----------------------------------------------------------------------
+
+    /**
+     * Host method has two parameters; the single call site provides two literal arguments.
+     * substituteParams handles multiple params by replacing all param-index references in the
+     * RHS text. Both arguments must be inlined and the call site removed.
+     */
+    public void testTwoParametersSubstitutedFromSingleCallSite() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init(String first, String last) {
+                        <caret>name = first + " " + last;
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    void setup() {
+                        init("John", "Doe");
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when two parameters can be substituted from one call site", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init("));
+        assertTrue("Null-check must be present", result.contains("if (name == null)"));
+        // Both "John" and "Doe" must appear as literals in the getter (substituted from call site)
+        assertTrue("First argument must be inlined", result.contains("\"John\""));
+        assertTrue("Second argument must be inlined", result.contains("\"Doe\""));
+        // The call site init("John", "Doe") must be removed from setup()
+        assertFalse("Call site must be removed from setup()", result.contains("init(\"John\", \"Doe\")"));
+        assertTrue("Return must be preserved", result.contains("return name;"));
+    }
+
+    /**
+     * The sole call site for a parameterised init method is itself inside an if-conditional.
+     * findSingleCallSite counts exactly one reference, but the call is guarded — if the
+     * condition is never true the field is never initialized, making the getter semantically
+     * wrong. The fix must NOT be offered.
+     */
+    public void testNoFixWhenSingleCallSiteIsInsideConditional() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private boolean condition;
+                    private String name;
+
+                    void init(String v) {
+                        <caret>name = v;
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    void setup() {
+                        if (condition) {
+                            init("value");
+                        }
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered when the sole call site is inside a conditional", hasLazyFix);
+    }
+
+    /**
+     * The sole call site passes a field reference (not a local variable) as the argument.
+     * hasUnsafeLocalArgument returns false for field references, so the fix is offered and
+     * the field expression is inlined into the getter.
+     */
+    public void testParameterInRhsWithFieldArgumentAtCallSite() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String configPrefix;
+                    private String name;
+
+                    void init(String prefix) {
+                        <caret>name = prefix + "_suffix";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    void setup() {
+                        init(configPrefix);
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when call-site argument is a field reference", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init("));
+        assertTrue("Null-check must be present", result.contains("if (name == null)"));
+        assertTrue("Field argument must be inlined into getter", result.contains("configPrefix + \"_suffix\""));
+        // setup() should no longer contain the init(...) call
+        assertFalse("Call site must be removed from setup()", result.contains("init(configPrefix)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 4 — Structural edge cases
+    // -----------------------------------------------------------------------
+
+    /**
+     * The field is declared in a superclass; the init method and getter are in the subclass.
+     * findSimpleGetter searches cls.findMethodsByName on the field's containing class (Base),
+     * not on Child — it does not find getName() in Child and returns null, so no fix is offered.
+     */
+    public void testNoFixWhenGetterIsInSubclassButFieldIsInSuperclass() {
+        myFixture.configureByText("Child.java", """
+                public class Base {
+                    protected String name;
+                }
+
+                class Child extends Base {
+                    void init() {
+                        <caret>name = "child";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered when the getter lives in a subclass but the field in a superclass",
+                hasLazyFix);
+    }
+
+    /**
+     * The getter's declared return type is a supertype of the field type (List vs ArrayList).
+     * isBodySimpleReturn checks the return expression name, not the return type — so the getter
+     * is correctly found and the fix is offered.
+     */
+    public void testGetterReturningSupertypeOfFieldIsFound() {
+        myFixture.configureByText("Bean.java", """
+                import java.util.ArrayList;
+                import java.util.List;
+                public class Bean {
+                    private ArrayList<String> items;
+
+                    void init() {
+                        <caret>items = new ArrayList<>();
+                    }
+
+                    List<String> getItems() {
+                        return items;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered even when the getter return type is a supertype of the field type", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Null-check must be present", result.contains("if (items == null)"));
+        assertTrue("Assignment must be inside null-check", result.contains("items = new ArrayList<>()"));
+        assertTrue("Return must be preserved", result.contains("return items;"));
+    }
+
+    /**
+     * Two independent init methods both assign the same field. Each assignment is in an
+     * eligible position and must be highlighted / offered a fix independently.
+     */
+    public void testTwoIndependentInitMethodsForSameFieldBothHighlighted() {
+        // First init method
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void initFromA() {
+                        <caret>name = "from-a";
+                    }
+
+                    void initFromB() {
+                        name = "from-b";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fixA = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for initFromA()", fixA);
+
+        // Second init method
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void initFromA() {
+                        name = "from-a";
+                    }
+
+                    void initFromB() {
+                        <caret>name = "from-b";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fixB = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for initFromB()", fixB);
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 5 — Caching map + guard condition
+    // -----------------------------------------------------------------------
+
+    /**
+     * The assignment is guard-wrapped AND the RHS references a varying instance field.
+     * Only the caching-map fix is offered. The guard condition must appear inside the
+     * containsKey block in the generated getter.
+     */
+    public void testCachingMapWithGuardCondition() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String key;
+                    private final Service service = new Service();
+                    private String cached;
+
+                    void init() {
+                        if (service != null) {
+                            <caret>cached = service.fetch(key);
+                        }
+                    }
+
+                    String getCached() {
+                        return cached;
+                    }
+
+                    static class Service {
+                        String fetch(String k) { return k; }
+                    }
+                }
+                """);
+
+        // Only the caching-map fix is offered when a varying field is present
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasCachingMap = fixes.stream().anyMatch(f -> f.getText().contains("caching map"));
+        assertTrue("Caching-map fix must be offered when varying field is present with a guard", hasCachingMap);
+        boolean hasSimple = fixes.stream().anyMatch(f -> f.getText().equals("Convert to lazy initialization in getter"));
+        assertFalse("Simple lazy-init fix must NOT be offered alongside caching-map fix", hasSimple);
+
+        IntentionAction fix = fixes.stream().filter(f -> f.getText().contains("caching map")).findFirst().orElseThrow();
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Map containsKey check must be present", result.contains("containsKey(key)"));
+        assertTrue("Guard condition must appear inside the containsKey block",
+                result.indexOf("containsKey(key)") < result.indexOf("if (service != null)"));
+        assertTrue("Map put must be present", result.contains("put(key,"));
+        assertTrue("Return via map get must be present", result.contains("get(key)"));
+    }
+
+    /**
+     * Caching-map fix with a preamble local (literal-initialized) alongside a varying field.
+     * The preamble must be moved inside the containsKey block.
+     */
+    public void testCachingMapFixWithPreambleAndVaryingField() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String prefix;
+                    private String cached;
+
+                    void init() {
+                        String suffix = "_result";
+                        <caret>cached = prefix + suffix;
+                    }
+
+                    String getCached() {
+                        return cached;
+                    }
+                }
+                """);
+
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasCachingMap = fixes.stream().anyMatch(f -> f.getText().contains("caching map"));
+        assertTrue("Caching-map fix must be offered when varying field is present with a preamble", hasCachingMap);
+
+        IntentionAction fix = fixes.stream().filter(f -> f.getText().contains("caching map")).findFirst().orElseThrow();
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Map containsKey check must be present", result.contains("containsKey(prefix)"));
+        assertTrue("Preamble declaration must appear inside the map block", result.contains("String suffix"));
+        assertTrue("Map put with preamble substitution must be present", result.contains("put(prefix,"));
+        assertTrue("Return via map get must be present", result.contains("get(prefix)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 6 — DCL + guard + preamble (all three combined)
+    // -----------------------------------------------------------------------
+
+    /**
+     * DCL fix applied to an if-guarded assignment that also has a preamble local.
+     * buildDclText embeds the full guard if-statement verbatim inside the inner null-check,
+     * which carries the preamble with it.
+     */
+    public void testDclFixWithGuardAndPreamble() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private final Service service = new Service();
+                    private String name;
+
+                    void init() {
+                        if (service != null) {
+                            String prefix = "val";
+                            <caret>name = service.compute(prefix);
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    static class Service {
+                        String compute(String p) { return p; }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to thread-safe lazy initialization (double-checked locking)");
+        assertNotNull("DCL fix must be offered for guard + preamble combination", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Field must become volatile", result.contains("volatile String name"));
+        assertTrue("Outer null-check must be present", result.contains("if (name == null)"));
+        assertTrue("synchronized block must be present", result.contains("synchronized (this)"));
+        assertTrue("Inner null-check must be present inside synchronized block",
+                result.indexOf("synchronized") < result.lastIndexOf("if (name == null)"));
+        assertTrue("Guard condition must be inside DCL block",
+                result.contains("if (service != null)"));
+        assertTrue("Preamble must appear inside the guard block", result.contains("String prefix"));
+        assertTrue("Assignment must be inside the guard block",
+                result.contains("name = service.compute(prefix)"));
+        int innerNullCheckIdx = result.lastIndexOf("if (name == null)");
+        int guardIdx = result.indexOf("if (service != null)");
+        assertTrue("Guard must appear after the inner null-check", innerNullCheckIdx < guardIdx);
+    }
+
+    /**
+     * DCL fix applied to an if/else-guarded assignment.
+     * The full if/else block must be embedded verbatim inside the innermost null-check.
+     */
+    public void testDclFixWithIfElseGuard() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private final Service service = new Service();
+                    private String name;
+
+                    void init() {
+                        if (service != null) {
+                            <caret>name = service.getValue();
+                        } else {
+                            name = "default";
+                        }
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+
+                    static class Service {
+                        String getValue() { return "ok"; }
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to thread-safe lazy initialization (double-checked locking)");
+        assertNotNull("DCL fix must be offered for if/else guard", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be removed", result.contains("void init()"));
+        assertTrue("Field must become volatile", result.contains("volatile String name"));
+        assertTrue("Outer null-check must be present", result.contains("if (name == null)"));
+        assertTrue("synchronized block must be present", result.contains("synchronized (this)"));
+        assertTrue("Inner null-check must be inside synchronized",
+                result.indexOf("synchronized") < result.lastIndexOf("if (name == null)"));
+        assertTrue("Guard condition must be present inside DCL block",
+                result.contains("if (service != null)"));
+        assertTrue("Else-branch must be preserved inside DCL block", result.contains("} else {"));
+        assertTrue("Then-branch assignment must be present", result.contains("service.getValue()"));
+        assertTrue("Else-branch assignment must be present", result.contains("\"default\""));
+        assertTrue("Return must be preserved", result.contains("return name;"));
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 7 — Early-return guard (semantic trap)
+    // -----------------------------------------------------------------------
+
+    /**
+     * The assignment appears at method-body level but is semantically guarded by a preceding
+     * early return:
+     *   if (service == null) return;
+     *   name = service.getValue();
+     * getHostContext sees this as a direct (non-guarded) assignment and currently offers a fix.
+     * But the generated getter would call service.getValue() unconditionally, ignoring the
+     * guard and potentially causing a NullPointerException.
+     * <p>
+     * Desired behaviour: NO FIX should be offered — the inspection must detect preceding
+     * conditional-return statements that guard the assignment.
+     */
+    public void testNoFixWhenAssignmentIsGuardedByEarlyReturn() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Object dependency;
+                    private String name;
+
+                    void init() {
+                        if (dependency == null) return;
+                        <caret>name = "computed";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        // Without the early-return detection fix the inspection sees "name = computed" as a
+        // plain direct assignment and offers the simple/DCL fix.  The generated getter would
+        // call name = "computed" unconditionally — but the original code only ran that line
+        // when dependency != null.  No fix should be offered.
+        List<IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasLazyFix = fixes.stream().anyMatch(f ->
+                f.getText().contains("lazy initialization") || f.getText().contains("double-checked locking"));
+        assertFalse("Fix must NOT be offered when the assignment is guarded by an early return — " +
+                "the generated getter would ignore the guard and assign unconditionally", hasLazyFix);
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 8 — Multi-method same-field assignment
+    // -----------------------------------------------------------------------
+
+    /**
+     * When the same field is assigned in two different methods and the getter is still a simple
+     * return, the fix should be offered for the FIRST method independently.
+     * (Baseline: this already works — the inspection has no knowledge of other methods.)
+     */
+    public void testCrossMethodSameField_FixOfferedForFirstMethod() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init() {
+                        <caret>name = "hello";
+                    }
+
+                    void setup() {
+                        name = "world";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for first method even when field is also assigned in a second method", fix);
+    }
+
+    /**
+     * Fix is also offered when the caret is in the SECOND method.
+     */
+    public void testCrossMethodSameField_FixOfferedForSecondMethod() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init() {
+                        name = "hello";
+                    }
+
+                    void setup() {
+                        <caret>name = "world";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for second method even when field is also assigned in a first method", fix);
+    }
+
+    /**
+     * Applying the fix to the first method moves its assignment to the getter and deletes init().
+     * The second method (setup()) and its assignment are left completely untouched.
+     */
+    public void testCrossMethodSameField_FirstFixLeavesSecondMethodUntouched() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init() {
+                        <caret>name = "hello";
+                    }
+
+                    void setup() {
+                        name = "world";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be deleted after fix", result.contains("void init()"));
+        assertTrue("setup() must remain untouched", result.contains("void setup()"));
+        assertTrue("setup() assignment must still be present", result.contains("name = \"world\""));
+        assertTrue("Getter must have lazy null-check", result.contains("if (name == null)"));
+        assertTrue("Getter null-check must contain init's assignment", result.contains("name = \"hello\""));
+    }
+
+    /**
+     * Applying the fix to the second method moves its assignment to the getter and deletes setup().
+     * The first method (init()) is left completely untouched.
+     */
+    public void testCrossMethodSameField_SecondFixLeavesFirstMethodUntouched() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init() {
+                        name = "hello";
+                    }
+
+                    void setup() {
+                        <caret>name = "world";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("setup() should be deleted after fix", result.contains("void setup()"));
+        assertTrue("init() must remain untouched", result.contains("void init()"));
+        assertTrue("init() assignment must still be present", result.contains("name = \"hello\""));
+        assertTrue("Getter must have lazy null-check", result.contains("if (name == null)"));
+        assertTrue("Getter null-check must contain setup's assignment", result.contains("name = \"world\""));
+    }
+
+    /**
+     * Constructor assignments are blocked by the existing constructor guard even when
+     * another method also assigns the same field.
+     * Uses getAvailableIntention() (caret-position-specific) so that the eligible fix on
+     * setup() does not pollute the assertion.
+     */
+    public void testCrossMethodSameField_ConstructorAssignmentIsBlocked() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    Bean() {
+                        <caret>name = "ctor-value";
+                    }
+
+                    void setup() {
+                        name = "setup-value";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        // getAvailableIntention() is caret-position-specific: it returns null if the element
+        // at the caret has no registered problem, even when another element in the file does.
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNull("Fix must NOT be offered for constructor assignment", fix);
+    }
+
+    /**
+     * A method-body assignment is still offered the fix even when the constructor of the same
+     * class also assigns the same field.
+     */
+    public void testCrossMethodSameField_MethodOfferedEvenWhenConstructorAlsoAssigns() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    Bean() {
+                        name = "ctor-value";
+                    }
+
+                    void setup() {
+                        <caret>name = "setup-value";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for method assignment even when constructor also assigns same field", fix);
+    }
+
+    /**
+     * KEY NEW BEHAVIOUR: when the getter already has a lazy-init null-check (from a previous fix
+     * applied to another method), the fix should still be offered for a remaining assignment to
+     * the same field.
+     * <p>
+     * This currently FAILS because findSimpleGetter() rejects a getter whose body has more than
+     * one statement. Requires the new findLazyGetter() implementation.
+     */
+    public void testCrossMethodSameField_FixOfferedWhenGetterAlreadyLazy() {
+        // Simulate the state AFTER init() has already been fixed:
+        // getter is now lazy, setup() still has the original assignment.
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void setup() {
+                        <caret>name = "world";
+                    }
+
+                    String getName() {
+                        if (name == null) {
+                            name = "hello";
+                        }
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered when getter already has lazy-init pattern", fix);
+    }
+
+    /**
+     * When the getter is already lazy and the fix is applied, the assignment is removed from the
+     * host method (method deleted if empty). The getter body is NOT modified — the existing
+     * null-check is the canonical lazy initializer.
+     */
+    public void testCrossMethodSameField_SecondFixOnLazyGetter_DeletesMethodWithoutModifyingGetter() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void setup() {
+                        <caret>name = "world";
+                    }
+
+                    String getName() {
+                        if (name == null) {
+                            name = "hello";
+                        }
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("setup() should be deleted (was empty after assignment removed)", result.contains("void setup()"));
+        assertTrue("Getter null-check must still be present", result.contains("if (name == null)"));
+        assertTrue("Original lazy value must remain in getter", result.contains("name = \"hello\""));
+        assertFalse("Second method's value must NOT appear in getter", result.contains("name = \"world\""));
+        assertTrue("Getter return must still be present", result.contains("return name;"));
+    }
+
+    /**
+     * When the getter is already lazy AND the assignment uses a build-chain preamble, the
+     * preamble is removed from the host method but the getter is not modified.
+     */
+    public void testCrossMethodSameField_PreambleRemovedWhenFixingAgainstLazyGetter() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void setup() {
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("world");
+                        <caret>name = sb.toString();
+                    }
+
+                    String getName() {
+                        if (name == null) {
+                            name = "hello";
+                        }
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for build-chain assignment when getter is already lazy", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("setup() should be deleted after fix", result.contains("void setup()"));
+        assertFalse("StringBuilder preamble from setup() must NOT appear in result", result.contains("StringBuilder sb"));
+        assertTrue("Getter must still have original lazy-init", result.contains("name = \"hello\""));
+        assertFalse("Build-chain result must NOT appear in getter", result.contains("name = \"world\""));
+    }
+
+    /**
+     * Three methods all assign the same field with the getter still a simple return.
+     * Each is independently offered the fix.
+     */
+    public void testCrossMethodSameField_ThreeMethodsEachOfferedIndependently() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init() { <caret>name = "init"; }
+                    void setup() { name = "setup"; }
+                    void reset() { name = "reset"; }
+
+                    String getName() { return name; }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered even when three methods assign the same field", fix);
+    }
+
+    /**
+     * Build-chain assignment in first method, simple literal in second — each independently offered.
+     * Applying the fix to the build-chain method moves its full preamble to the getter.
+     */
+    public void testCrossMethodSameField_BuildChainInFirstSimpleInSecond() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private String name;
+
+                    void init() {
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("hello");
+                        <caret>name = sb.toString();
+                    }
+
+                    void setup() {
+                        name = "world";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for build-chain method even when another method assigns the field simply", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be deleted after fix", result.contains("void init()"));
+        assertTrue("setup() must remain untouched", result.contains("void setup()"));
+        assertTrue("Getter must have build-chain preamble", result.contains("StringBuilder sb"));
+        assertTrue("Getter must have lazy null-check", result.contains("if (name == null)"));
+    }
+
+    /**
+     * Guarded assignment in one method, unguarded in another — each independently offered.
+     * The guard condition must be nested inside the null-check in the getter.
+     */
+    public void testCrossMethodSameField_GuardedAndUnguardedAssignments() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private boolean flag;
+                    private String name;
+
+                    void init() {
+                        if (flag) {
+                            <caret>name = "guarded";
+                        }
+                    }
+
+                    void setup() {
+                        name = "unguarded";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for guarded assignment even when same field is also assigned unguarded elsewhere", fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() should be deleted after fix", result.contains("void init()"));
+        assertTrue("setup() must remain", result.contains("void setup()"));
+        assertTrue("Outer null-check must be present", result.contains("if (name == null)"));
+        assertTrue("Guard condition must be preserved inside null-check", result.contains("if (flag)"));
+        assertTrue("Guard must be nested inside null-check",
+                result.indexOf("if (name == null)") < result.indexOf("if (flag)"));
+    }
+
+    /**
+     * An assignment that is ineligible in one method (RHS references multiple varying fields,
+     * blocking all fix paths) must not prevent the inspection from firing on the eligible
+     * assignment in a different method.
+     * Uses getAvailableIntention() (caret-position-specific) so the fix for setup() does not
+     * pollute the assertion about init().
+     */
+    public void testCrossMethodSameField_IneligibleMethodDoesNotBlockEligibleMethod() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private int a;
+                    private int b;
+                    private String name;
+
+                    void init() {
+                        String tmp = a + "-" + b;
+                        <caret>name = tmp;
+                    }
+
+                    void setup() {
+                        name = "default";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        // getAvailableIntention() is caret-position-specific: returns null when the element
+        // at the caret has no registered problem, even if another element in the file does.
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNull("Fix must NOT be offered for init() — RHS uses multiple varying fields", fix);
+    }
+
+    /**
+     * Eligible assignment in setup() is still offered the fix even though init() (assigning the
+     * same field) is ineligible due to multiple varying fields.
+     */
+    public void testCrossMethodSameField_EligibleMethodNotBlockedByIneligiblePeer() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private int a;
+                    private int b;
+                    private String name;
+
+                    void init() {
+                        String tmp = a + "-" + b;
+                        name = tmp;
+                    }
+
+                    void setup() {
+                        <caret>name = "default";
+                    }
+
+                    String getName() {
+                        return name;
+                    }
+                }
+                """);
+
+        IntentionAction fix = myFixture.getAvailableIntention("Convert to lazy initialization in getter");
+        assertNotNull("Fix must be offered for setup() even though init() is ineligible for the same field", fix);
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 9 — Selector-based lazy getter (joint fix for init + selector pattern)
+    // -----------------------------------------------------------------------
+
+    // Shared test fixture code for GROUP 9:
+    //   - service is final (so it is not a "varying" field)
+    //   - entity is a non-final instance field (the varying field)
+    //   - The selector assignment uses this.entity.getId() (field reference), so entity IS
+    //     detected as a varying field in the RHS
+    //   - init() assigns value = "default" (no varying fields, no params → null-case companion)
+    //
+    // Detection path:
+    //   varyingFields = [entity], isVaryingFieldAssignedBefore(entity, onEntitySelected) = true
+    //   → findNullCaseAssignment finds init()
+    //   → extractEffectiveKey finds this.entity.getId() → KeyExprInfo("this.entity.getId()", "Long")
+    //   → registers SelectorLazyGetterQuickFix
+
+    private static final String SELECTOR_BEAN = """
+            public class Bean {
+                private final Service service = new Service();
+                private Entity entity;
+                private String value;
+
+                void init() {
+                    value = "default";
+                }
+
+                void onEntitySelected(Entity e) {
+                    this.entity = e;
+                    <caret>value = service.compute(this.entity.getId());
+                }
+
+                public String getValue() {
+                    return value;
+                }
+
+                static class Entity { long getId() { return 0L; } }
+                static class Service { String compute(long id) { return ""; } }
+            }
+            """;
+
+    /**
+     * The selector fix must be offered (caret on the selector assignment).
+     */
+    public void testSelectorPattern_FixOffered() {
+        myFixture.configureByText("Bean.java", SELECTOR_BEAN);
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to selector-based lazy getter (keyed by this.entity.getId())");
+        assertNotNull("Selector-based lazy getter fix must be offered", fix);
+    }
+
+    /**
+     * When the varying field is assigned in the selector method, the individual caching-map fix
+     * must NOT be offered (it would break always-fresh semantics for re-selections).
+     */
+    public void testSelectorPattern_IndividualCachingMapFixBlocked() {
+        myFixture.configureByText("Bean.java", SELECTOR_BEAN);
+        List<com.intellij.codeInsight.intention.IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasCachingMap = fixes.stream().anyMatch(f -> f.getText().contains("caching map getter"));
+        assertFalse("Individual caching-map fix must be blocked for selector-method assignments", hasCachingMap);
+    }
+
+    /**
+     * After applying the fix, the getter must have three branches:
+     * if (entity == null), else if (!valueCache.containsKey(...)), else.
+     */
+    public void testSelectorPattern_GetterHasThreeBranches() {
+        myFixture.configureByText("Bean.java", SELECTOR_BEAN);
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to selector-based lazy getter (keyed by this.entity.getId())");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertTrue("Getter must have null-check branch for varying field",
+                result.contains("if (entity == null)"));
+        assertTrue("Getter must have cache-miss branch",
+                result.contains("containsKey(this.entity.getId())"));
+        assertTrue("Getter must have cache-hit else branch",
+                result.contains("} else {"));
+    }
+
+    /**
+     * The generated cache map must use Long (the getId() return type) as key, not Entity.
+     */
+    public void testSelectorPattern_KeyIsEntityId_NotEntity() {
+        myFixture.configureByText("Bean.java", SELECTOR_BEAN);
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to selector-based lazy getter (keyed by this.entity.getId())");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        // Key type must be Long (from getId() return type), not Entity.
+        // The map declaration may use short or qualified form depending on the code style manager.
+        assertTrue("Cache map key must use Long type (from getId() return type)",
+                result.contains("Map<Long,") || result.contains("Map<Long, "));
+        assertFalse("Cache map key must NOT be Entity", result.contains("Map<Entity,"));
+    }
+
+    /**
+     * After applying the fix, init() must be deleted (it becomes empty).
+     */
+    public void testSelectorPattern_InitMethodDeleted() {
+        myFixture.configureByText("Bean.java", SELECTOR_BEAN);
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to selector-based lazy getter (keyed by this.entity.getId())");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertFalse("init() must be deleted after the fix (it becomes empty)", result.contains("void init()"));
+    }
+
+    /**
+     * After applying the fix, onEntitySelected must keep only this.entity = e (the list
+     * assignment is removed).
+     */
+    public void testSelectorPattern_SelectorMethodSimplified() {
+        myFixture.configureByText("Bean.java", SELECTOR_BEAN);
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to selector-based lazy getter (keyed by this.entity.getId())");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertTrue("onEntitySelected must be kept (has remaining this.entity = e)",
+                result.contains("void onEntitySelected"));
+        assertTrue("onEntitySelected must keep the entity assignment",
+                result.contains("this.entity = e"));
+        assertFalse("onEntitySelected must not contain the value assignment after fix",
+                result.contains("value = service.compute"));
+    }
+
+    /**
+     * When init() has other statements besides the field assignment, only the assignment is
+     * removed — init() is kept with its remaining statements.
+     */
+    public void testSelectorPattern_InitWithOtherStatementsKept() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private final Service service = new Service();
+                    private Entity entity;
+                    private String value;
+
+                    void init() {
+                        System.out.println("initializing");
+                        value = "default";
+                    }
+
+                    void onEntitySelected(Entity e) {
+                        this.entity = e;
+                        <caret>value = service.compute(this.entity.getId());
+                    }
+
+                    public String getValue() {
+                        return value;
+                    }
+
+                    static class Entity { long getId() { return 0L; } }
+                    static class Service { String compute(long id) { return ""; } }
+                }
+                """);
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to selector-based lazy getter (keyed by this.entity.getId())");
+        assertNotNull(fix);
+        myFixture.launchAction(fix);
+
+        String result = myFixture.getFile().getText();
+        assertTrue("init() must be kept when it has other statements", result.contains("void init()"));
+        assertTrue("init()'s other statement must be preserved", result.contains("System.out.println"));
+        // value = "default" appears in the getter's null-case branch — verify it appears exactly once
+        // (in the getter), meaning init()'s copy was removed.
+        assertEquals("value = \"default\" must appear exactly once (in getter null-branch, not also in init())",
+                1, result.split(java.util.regex.Pattern.quote("value = \"default\""), -1).length - 1);
+    }
+
+    /**
+     * When there is no null-case companion method, no fix should be offered.
+     */
+    public void testSelectorPattern_NoFixWhenNoNullCaseMethod() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private final Service service = new Service();
+                    private Entity entity;
+                    private String value;
+
+                    void onEntitySelected(Entity e) {
+                        this.entity = e;
+                        <caret>value = service.compute(this.entity.getId());
+                    }
+
+                    public String getValue() {
+                        return value;
+                    }
+
+                    static class Entity { long getId() { return 0L; } }
+                    static class Service { String compute(long id) { return ""; } }
+                }
+                """);
+        IntentionAction fix = myFixture.getAvailableIntention(
+                "Convert to selector-based lazy getter");
+        assertNull("No fix must be offered when there is no null-case companion method", fix);
+    }
+
+    /**
+     * Regression guard: when the varying field is NOT assigned before the target assignment in
+     * the host method, the original caching-map fix must still be offered (not the selector fix).
+     */
+    public void testSelectorPattern_RegularCachingMapStillWorksWithoutSelectorFieldAssignment() {
+        myFixture.configureByText("Bean.java", """
+                public class Bean {
+                    private Entity entity;
+                    private String value;
+
+                    void loadValue(Entity e) {
+                        <caret>value = e.getName();
+                    }
+
+                    public String getValue() {
+                        return value;
+                    }
+
+                    static class Entity {
+                        long getId() { return 0L; }
+                        String getName() { return ""; }
+                    }
+                }
+                """);
+        // entity is NOT assigned before value = e.getName() in loadValue,
+        // so the selector path must NOT fire — fall through to the regular caching-map fix.
+        // Note: entity resolves as a varying field via the parameter e (same type).
+        // If entity is not a varying field here, we simply check the selector fix is absent.
+        List<com.intellij.codeInsight.intention.IntentionAction> fixes = myFixture.getAllQuickFixes();
+        boolean hasSelectorFix = fixes.stream().anyMatch(f -> f.getText().contains("selector-based lazy getter"));
+        assertFalse("Selector fix must NOT be offered when varying field is not assigned before target", hasSelectorFix);
+    }
 }

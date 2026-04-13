@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ruleset
+    name="Lazy Init Plugin Rules"
+    xmlns="http://pmd.sourceforge.net/ruleset/2.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0 https://pmd.github.io/pmd-7.0.0/ruleset_xml_schema.xsd">
+    <description>
+        Build-breaking PMD rules for maintainability issues we want to catch locally.
+    </description>
+
+    <rule ref="category/java/design.xml/CognitiveComplexity">
+        <properties>
+            <property name="methodReportLevel" value="15" />
+            <property name="classReportLevel" value="50" />
+        </properties>
+    </rule>
+</ruleset>
