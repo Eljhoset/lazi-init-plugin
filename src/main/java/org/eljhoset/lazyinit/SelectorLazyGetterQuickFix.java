@@ -38,14 +38,19 @@ import org.jetbrains.annotations.Nullable;
 public class SelectorLazyGetterQuickFix implements LocalQuickFix {
     private static final Logger LOG = Logger.getInstance(SelectorLazyGetterQuickFix.class);
 
+    private final String fieldName;
     private final String varyingFieldName;
+    private final String selectorMethodName;
     private final String nullCaseMethodName;
     private final String keyExprText;
     private final String keyTypeName;
 
-    public SelectorLazyGetterQuickFix(@NotNull String varyingFieldName, @NotNull String nullCaseMethodName,
+    public SelectorLazyGetterQuickFix(@NotNull String fieldName, @NotNull String varyingFieldName,
+                                       @NotNull String selectorMethodName, @NotNull String nullCaseMethodName,
                                        @NotNull String keyExprText, @NotNull String keyTypeName) {
+        this.fieldName = fieldName;
         this.varyingFieldName = varyingFieldName;
+        this.selectorMethodName = selectorMethodName;
         this.nullCaseMethodName = nullCaseMethodName;
         this.keyExprText = keyExprText;
         this.keyTypeName = keyTypeName;
@@ -58,36 +63,42 @@ public class SelectorLazyGetterQuickFix implements LocalQuickFix {
 
     @Override
     public void applyFix(@NotNull Project project, @NotNull ProblemDescriptor descriptor) {
-        PsiAssignmentExpression selectorAssignment = (PsiAssignmentExpression) descriptor.getPsiElement();
-        PsiField field = LazyInitInspection.resolveToField(selectorAssignment.getLExpression());
+        PsiClass cls = com.intellij.psi.util.PsiTreeUtil.getParentOfType(descriptor.getPsiElement(), PsiClass.class);
+        if (cls == null) return;
+
+        PsiField field = cls.findFieldByName(fieldName, false);
         if (field == null) {
-            debug("Skipping: field not resolved");
+            debug("Skipping: field '" + fieldName + "' not found in class");
+            return;
+        }
+
+        PsiMethod getter = LazyInitInspection.findSimpleGetter(field);
+        if (getter == null) {
+            debug("Skipping: no simple getter for field '" + fieldName + "'");
+            return;
+        }
+
+        PsiMethod selectorMethod = findMethodByName(cls, selectorMethodName);
+        if (selectorMethod == null) {
+            debug("Skipping: selector method '" + selectorMethodName + "' not found");
+            return;
+        }
+        PsiAssignmentExpression selectorAssignment = LazyInitInspection.findFieldAssignmentInMethod(selectorMethod, field);
+        if (selectorAssignment == null) {
+            debug("Skipping: no assignment to '" + fieldName + "' in selector method '" + selectorMethodName + "'");
             return;
         }
         PsiExpression selectorRhs = selectorAssignment.getRExpression();
         if (selectorRhs == null) return;
-
-        LazyInitInspection.HostContext hostCtx = LazyInitInspection.getHostContext(selectorAssignment);
-        if (hostCtx == null) return;
-        PsiMethod selectorMethod = hostCtx.method();
-
-        PsiMethod getter = LazyInitInspection.findSimpleGetter(field);
-        if (getter == null) {
-            debug("Skipping: no simple getter for field '" + field.getName() + "'");
-            return;
-        }
-
-        PsiClass cls = field.getContainingClass();
-        if (cls == null) return;
 
         PsiMethod nullCaseMethod = findMethodByName(cls, nullCaseMethodName);
         if (nullCaseMethod == null) {
             debug("Skipping: null-case method '" + nullCaseMethodName + "' not found");
             return;
         }
-        PsiAssignmentExpression nullCaseAssignment = findFieldAssignmentInMethod(nullCaseMethod, field);
+        PsiAssignmentExpression nullCaseAssignment = LazyInitInspection.findFieldAssignmentInMethod(nullCaseMethod, field);
         if (nullCaseAssignment == null) {
-            debug("Skipping: no assignment to '" + field.getName() + "' in null-case method");
+            debug("Skipping: no assignment to '" + fieldName + "' in null-case method");
             return;
         }
         PsiExpression nullCaseRhs = nullCaseAssignment.getRExpression();
@@ -151,20 +162,6 @@ public class SelectorLazyGetterQuickFix implements LocalQuickFix {
     private static PsiMethod findMethodByName(PsiClass cls, String name) {
         PsiMethod[] methods = cls.findMethodsByName(name, false);
         return methods.length > 0 ? methods[0] : null;
-    }
-
-    @Nullable
-    private static PsiAssignmentExpression findFieldAssignmentInMethod(PsiMethod method, PsiField field) {
-        PsiCodeBlock body = method.getBody();
-        if (body == null) return null;
-        for (PsiStatement stmt : body.getStatements()) {
-            if (stmt instanceof PsiExpressionStatement exprStmt
-                    && exprStmt.getExpression() instanceof PsiAssignmentExpression assign
-                    && LazyInitInspection.resolveToField(assign.getLExpression()) == field) {
-                return assign;
-            }
-        }
-        return null;
     }
 
     private static void debug(String message) {

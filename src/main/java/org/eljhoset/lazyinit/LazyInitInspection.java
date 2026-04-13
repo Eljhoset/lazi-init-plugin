@@ -35,6 +35,10 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
     /** Resolved getter method and whether it already contains the lazy-init null-check. */
     private record GetterInfo(PsiMethod getter, boolean alreadyLazy) {}
 
+    /** Selector-side companion discovered while scanning sibling methods of a null-case assignment. */
+    private record SelectorCompanionCandidate(PsiMethod method, PsiField varyingField,
+                                              String keyExpr, String keyType) {}
+
     /** Identifies the host method and any enclosing if-guard for an assignment. */
     record HostContext(@NotNull PsiMethod method, @Nullable PsiIfStatement guardIfStatement) {
         @Nullable String guardConditionText() {
@@ -62,7 +66,6 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         HostContext hostCtx = getHostContext(expression);
         if (hostCtx == null) { debugSkip(expression, "assignment is not in an eligible position"); return; }
         PsiMethod hostMethod = hostCtx.method();
-        if (hostMethod.isConstructor()) { debugSkip(expression, "host method '" + hostMethod.getName() + "' is a constructor"); return; }
         // Try simple getter first; fall back to lazy getter (getter already has null-check).
         GetterInfo getterInfo = resolveGetterInfo(field);
         if (getterInfo == null) {
@@ -71,6 +74,10 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         }
         PsiMethod getter = getterInfo.getter();
         boolean getterAlreadyLazy = getterInfo.alreadyLazy();
+        if (hostMethod.isConstructor() || hostMethod.equals(getter)) {
+            debugSkip(expression, "host method '" + hostMethod.getName() + "' is ineligible (constructor or getter)");
+            return;
+        }
 
         // When the getter already owns the lazy initialisation, the fix only removes the
         // assignment (and its preamble) from the host method — nothing is inserted into the
@@ -105,7 +112,7 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         }
         PsiField varyingField = varyingFields.size() == 1 ? varyingFields.getFirst() : null;
 
-        if (varyingField != null && checkSelectorPattern(field, varyingField, hostMethod, rhs, hostRefs, expression, holder)) {
+        if (checkSelectionPattern(varyingField, field, hostMethod, rhs, hostRefs, expression, holder)) {
             return;
         }
 
@@ -265,11 +272,11 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
     private static boolean checkSelectorPattern(PsiField field, PsiField varyingField, PsiMethod hostMethod,
                                                  PsiExpression rhs, Collection<PsiReference> hostRefs,
                                                  PsiAssignmentExpression expression, ProblemsHolder holder) {
-        if (!isVaryingFieldAssignedBefore(varyingField, hostMethod, expression)) return false;
+        if (varyingFieldNotAssignedBefore(varyingField, hostMethod, expression)) return false;
         PsiAssignmentExpression nullCase = findNullCaseAssignment(field, varyingField);
         if (nullCase == null) {
-            debugSkip(expression, "selector-method pattern — no null-case companion found");
-            return true;
+            // No null-case companion — fall through to the caching-map fix which is still valid.
+            return false;
         }
         KeyExprInfo key = extractEffectiveKey(rhs, varyingField);
         String keyExpr = key != null ? key.keyExprText() : varyingField.getName();
@@ -283,8 +290,8 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
                 + "' keyed by '" + keyExpr + "'");
         holder.registerProblem(expression,
                 buildMessage(field, hostMethod.getName(), hostRefs.size()),
-                new SelectorLazyGetterQuickFix(varyingField.getName(),
-                        nullCaseMethod.getName(), keyExpr, keyType));
+                new SelectorLazyGetterQuickFix(field.getName(), varyingField.getName(),
+                        hostMethod.getName(), nullCaseMethod.getName(), keyExpr, keyType));
         return true;
     }
 
@@ -321,24 +328,24 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
      * statement that appears before the statement containing {@code targetAssignment} in
      * {@code hostMethod}'s body.
      */
-    static boolean isVaryingFieldAssignedBefore(PsiField varyingField, PsiMethod hostMethod,
-                                                 PsiAssignmentExpression targetAssignment) {
+    static boolean varyingFieldNotAssignedBefore(PsiField varyingField, PsiMethod hostMethod,
+                                                   PsiAssignmentExpression targetAssignment) {
         PsiCodeBlock body = hostMethod.getBody();
-        if (body == null) return false;
+        if (body == null) return true;
         PsiStatement assignmentStmt = PsiTreeUtil.getParentOfType(targetAssignment, PsiStatement.class);
-        if (assignmentStmt == null) return false;
+        if (assignmentStmt == null) return true;
         // Walk up to the direct child of body (handles if-guarded assignments)
         PsiElement topLevel = assignmentStmt;
         while (topLevel.getParent() != body) {
             PsiElement next = topLevel.getParent();
-            if (next == null || next instanceof PsiMethod) return false;
+            if (next == null || next instanceof PsiMethod) return true;
             topLevel = next;
         }
         for (PsiStatement stmt : body.getStatements()) {
             if (stmt == topLevel) break;
-            if (isDirectAssignmentTo(stmt, varyingField)) return true;
+            if (isDirectAssignmentTo(stmt, varyingField)) return false;
         }
-        return false;
+        return true;
     }
 
     private static boolean isDirectAssignmentTo(PsiStatement stmt, PsiField field) {
@@ -389,6 +396,87 @@ public class LazyInitInspection extends AbstractBaseJavaLocalInspectionTool {
         if (refsVarying || referencesParam(rhs, method)) return null;
         if (!findVaryingFields(rhs, method, target).isEmpty()) return null;
         return assign;
+    }
+
+    /**
+     * Returns the first top-level simple assignment to {@code field} in {@code method}'s body,
+     * or {@code null} if none exists.
+     */
+    static @Nullable PsiAssignmentExpression findFieldAssignmentInMethod(PsiMethod method, PsiField field) {
+        PsiCodeBlock body = method.getBody();
+        if (body == null) return null;
+        for (PsiStatement stmt : body.getStatements()) {
+            if (stmt instanceof PsiExpressionStatement exprStmt
+                    && exprStmt.getExpression() instanceof PsiAssignmentExpression assign
+                    && resolveToField(assign.getLExpression()) == field) {
+                return assign;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Dispatches to either the selector-side or null-case-side companion check.
+     * Returning {@code true} means a fix was registered (or the pattern was handled and should
+     * not fall through to {@link #buildFixes}).
+     */
+    private static boolean checkSelectionPattern(PsiField varyingField, PsiField field, PsiMethod hostMethod,
+                                                  PsiExpression rhs, Collection<PsiReference> hostRefs,
+                                                  PsiAssignmentExpression expression, ProblemsHolder holder) {
+        if (varyingField != null) {
+            return checkSelectorPattern(field, varyingField, hostMethod, rhs, hostRefs, expression, holder);
+        }
+        return checkNullCaseCompanion(field, hostMethod, hostRefs, expression, holder);
+    }
+
+    /**
+     * When the current assignment has no varying fields (it is a potential null-case), scans
+     * other class methods for a selector companion that assigns the same field.  If found,
+     * offers {@link SelectorLazyGetterQuickFix} from this (null-case) side.
+     */
+    private static boolean checkNullCaseCompanion(PsiField field, PsiMethod nullCaseMethod,
+                                                   Collection<PsiReference> hostRefs,
+                                                   PsiAssignmentExpression expression, ProblemsHolder holder) {
+        PsiClass cls = field.getContainingClass();
+        if (cls == null) return false;
+        SelectorCompanionCandidate companion = Arrays.stream(cls.getMethods())
+                .map(method -> toSelectorCompanionCandidate(method, nullCaseMethod, field, expression))
+                .filter(Objects::nonNull)
+                .findFirst()
+                .orElse(null);
+        if (companion == null) return false;
+        debug("Registering selector fix (null-case side) for field '" + field.getName()
+                + "' with selector '" + companion.method().getName() + "'");
+        holder.registerProblem(expression,
+                buildMessage(field, nullCaseMethod.getName(), hostRefs.size()),
+                new SelectorLazyGetterQuickFix(field.getName(), companion.varyingField().getName(),
+                        companion.method().getName(), nullCaseMethod.getName(),
+                        companion.keyExpr(), companion.keyType()));
+        return true;
+    }
+
+    private static @Nullable SelectorCompanionCandidate toSelectorCompanionCandidate(PsiMethod method,
+                                                                                      PsiMethod nullCaseMethod,
+                                                                                      PsiField field,
+                                                                                      PsiAssignmentExpression expression) {
+        if (method.isConstructor() || method == nullCaseMethod) return null;
+        PsiAssignmentExpression selectorAssign = findFieldAssignmentInMethod(method, field);
+        if (selectorAssign == null) return null;
+        PsiExpression selectorRhs = selectorAssign.getRExpression();
+        if (selectorRhs == null) return null;
+        PsiField varyingField = findVaryingField(selectorRhs, method, field);
+        if (varyingField == null) return null;
+        if (varyingFieldNotAssignedBefore(varyingField, method, selectorAssign)) return null;
+        return buildSelectorCompanionCandidate(method, varyingField, selectorRhs, expression);
+    }
+
+    private static SelectorCompanionCandidate buildSelectorCompanionCandidate(PsiMethod method, PsiField varyingField,
+                                                                              PsiExpression selectorRhs,
+                                                                              PsiAssignmentExpression expression) {
+        KeyExprInfo key = extractEffectiveKey(selectorRhs, varyingField);
+        String keyExpr = key != null ? key.keyExprText() : varyingField.getName();
+        String keyType = key != null ? key.keyTypeName() : boxedTypeName(varyingField.getType(), expression);
+        return new SelectorCompanionCandidate(method, varyingField, keyExpr, keyType);
     }
 
     /**
