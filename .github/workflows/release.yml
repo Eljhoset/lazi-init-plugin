@@ -26,12 +26,21 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "version=$(./gradlew properties -q | grep '^version:' | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(./gradlew properties -q | grep '^version:' | awk '{print $2}')
+          if [[ "$version" == *-SNAPSHOT ]]; then
+            tag="v${version}-${GITHUB_SHA::7}"
+          else
+            tag="v${version}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ contains(steps.version.outputs.version, 'SNAPSHOT') }}
           files: build/distributions/*.zip
           generate_release_notes: true
