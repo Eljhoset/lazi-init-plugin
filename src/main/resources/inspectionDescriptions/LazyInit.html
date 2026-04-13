@@ -7,7 +7,7 @@ Reports field assignments inside methods that can be moved into a lazy null-chec
     deferred to the first access. This removes the need to call the initializer method explicitly and
     makes initialization transparent to callers.
 </p>
-<p>Two quick-fix variants are offered:</p>
+<p>Several quick-fix variants are offered depending on the pattern detected:</p>
 <ul>
     <li>
         <b>Simple lazy initialization</b> — adds a null-check guard before the return statement:
@@ -36,6 +36,56 @@ String getName() {
 }
 </code></pre>
     </li>
+    <li>
+        <b>Caching-map lazy initialization</b> — offered when the right-hand side depends on a varying
+        instance field (e.g. a selected entity). A <code>Map</code> keyed by the varying field (or a derived
+        key such as <code>entity.getId()</code>) is added as a companion field, and the getter performs a
+        cache-miss check before computing the value:
+<pre><code>
+// Before
+void onEntitySelected(Entity entity) {
+    this.entity = entity;
+    items = service.getItems(entity.getId());
+}
+
+// After
+List&lt;Item&gt; getItems() {
+    if (!itemsCache.containsKey(entity.getId())) {
+        itemsCache.put(entity.getId(), service.getItems(entity.getId()));
+    }
+    items = itemsCache.get(entity.getId());
+    return items;
+}
+</code></pre>
+    </li>
+    <li>
+        <b>Selector-based lazy getter</b> — offered when two complementary methods exist: a
+        <em>selector method</em> that assigns a varying instance field and then assigns the target field
+        using it, and a <em>null-case method</em> that assigns the target field with a constant
+        (parameter-free) expression. A three-branch caching getter is generated and both assignment
+        methods are simplified or deleted:
+<pre><code>
+// Before
+void init()                         { items = new ArrayList&lt;&gt;(); }
+void onEntitySelected(Entity e)     { this.entity = e;
+                                      items = service.getItems(entity.getId()); }
+
+// After
+List&lt;Item&gt; getItems() {
+    if (entity == null) {
+        items = new ArrayList&lt;&gt;();
+    } else if (!itemsCache.containsKey(entity.getId())) {
+        List&lt;Item&gt; fetched = service.getItems(entity.getId());
+        itemsCache.put(entity.getId(), fetched);
+        items = fetched;
+    } else {
+        items = itemsCache.get(entity.getId());
+    }
+    return items;
+}
+</code></pre>
+        The fix is available from either the selector assignment or the null-case assignment.
+    </li>
 </ul>
 <p><b>Argument objects built before the call</b></p>
 <p>
@@ -52,10 +102,6 @@ void init() {
     service = sb.toString();
 }
 
-String getService() {
-    return service;
-}
-
 // After — the build chain moves into the getter
 String getService() {
     if (service == null) {
@@ -67,9 +113,9 @@ String getService() {
 }
 </code></pre>
 <p>
-    The fix is suppressed when the build chain references another local variable (e.g., a local is
-    used as a setter argument), when the local is used in any statement other than its own build
-    chain and the assignment, or when the RHS mixes method parameters with local variables.
+    The fix is suppressed when the build chain references another local variable, when the local is
+    used in any statement outside its own build chain and the assignment, or when the RHS mixes method
+    parameters with local variables.
 </p>
 <p>
     The host method is deleted automatically if it becomes empty after the assignment and its
@@ -80,10 +126,11 @@ String getService() {
 <ul>
     <li>The field already has a non-null initializer (e.g. <code>= new ArrayList&lt;&gt;()</code>).</li>
     <li>The field is <code>final</code>.</li>
-    <li>The assignment is inside a constructor.</li>
-    <li>The getter body is not a simple <code>return field;</code> statement.</li>
+    <li>The assignment is inside a constructor or inside the field's own getter.</li>
+    <li>The getter body is not a simple <code>return field;</code> statement (or already contains a lazy null-check).</li>
     <li>A local variable in the RHS has a build chain that references another local.</li>
     <li>A local variable in the RHS is used in a statement outside its own build chain.</li>
+    <li>The RHS references more than one varying instance field (composite keys are not supported).</li>
 </ul>
 </body>
 </html>
